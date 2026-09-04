@@ -1,0 +1,268 @@
+diff --git a/config/electron-builder.config.cjs b/config/electron-builder.config.cjs
+index 06d41bad..c2c62cce 100644
+--- a/config/electron-builder.config.cjs
++++ b/config/electron-builder.config.cjs
+@@ -37,6 +37,7 @@ const isWinAdhoc = process.env.ORCA_WIN_ADHOC === '1'
+ const isWinDevChannel = isWinHourly || isWinDaily || isWinAdhoc
+ const isMacRelease = process.env.ORCA_MAC_RELEASE === '1' || isMacHourly || isMacDaily || isMacAdhoc
+ const isLinuxArm64Release = process.env.ORCA_LINUX_ARM64_RELEASE === '1'
++const isLinuxHardened = process.env.ORCA_HARDENED_LINUX === '1'
+ const localBuildVersion =
+   isMacRelease || isWinDevChannel ? undefined : process.env.ORCA_LOCAL_BUILD_VERSION
+ const isHourlyChannel = isMacHourly || isWinHourly
+@@ -62,7 +63,7 @@ const devChannelRepo = isHourlyChannel
+     : isAdhocChannel
+       ? 'orca-adhoc'
+       : null
+-const appId = 'com.stablyai.orca'
++const appId = isLinuxHardened ? 'com.ersh123.orca-hardened' : 'com.stablyai.orca'
+ const featureWallResources = {
+   from: 'resources/onboarding/feature-wall',
+   to: 'onboarding/feature-wall'
+@@ -137,8 +138,12 @@ const MARKDOWN_FILE_EXTENSIONS = ['md', 'markdown', 'mdx']
+ /** @type {import('electron-builder').Configuration} */
+ module.exports = {
+   appId,
+-  productName: 'Orca',
+-  protocols: [{ name: 'Orca', schemes: ['orca'] }],
++  productName: isLinuxHardened ? 'Orca Hardened' : 'Orca',
++  protocols: [
++    isLinuxHardened
++      ? { name: 'Orca Hardened', schemes: ['orca-hardened'] }
++      : { name: 'Orca', schemes: ['orca'] }
++  ],
+   toolsets: { appimage: '1.0.3' },
+   ...(devChannelBuildVersion
+     ? { extraMetadata: { version: devChannelBuildVersion } }
+@@ -532,7 +537,7 @@ module.exports = {
+     mimeTypes: ['text/markdown'],
+     // Why: Ubuntu desktop ships GNOME Orca as the `orca` package and /usr/bin/orca.
+     // The Linux installer should not claim those system package/file names.
+-    executableName: 'orca-ide',
++    executableName: isLinuxHardened ? 'orca-hardened' : 'orca-ide',
+     // Why: the icns source lets electron-builder emit standard hicolor PNG
+     // sizes; a single 1024px PNG is ignored by some Linux docks/launchers.
+     icon: 'resources/build/icon.icns',
+@@ -540,17 +545,34 @@ module.exports = {
+       entry: {
+         // Why: Electron reports WM_CLASS=orca for the visible Linux window;
+         // GNOME docks need an exact match to group it with orca-ide.desktop.
+-        StartupWMClass: 'orca'
++        StartupWMClass: isLinuxHardened ? 'orca-hardened' : 'orca'
+       }
+     },
+     extraResources: [
+       ...commonExtraResources,
+       ...createPackagedRuntimeNodeModuleResources('linux'),
+       linuxSpeechNativeResource,
+-      {
+-        from: 'resources/linux/bin/orca-ide',
+-        to: 'bin/orca-ide'
+-      },
++      isLinuxHardened
++        ? {
++            from: 'resources/linux/bin/orca-hardened',
++            to: 'bin/orca-hardened'
++          }
++        : {
++            from: 'resources/linux/bin/orca-ide',
++            to: 'bin/orca-ide'
++          },
++      ...(isLinuxHardened
++        ? [
++            {
++              from: 'resources/linux/packaging/orca-hardened-agents.slice',
++              to: 'linux/packaging/orca-hardened-agents.slice'
++            },
++            {
++              from: 'resources/linux/packaging/build-manifest.json',
++              to: 'linux/packaging/build-manifest.json'
++            }
++          ]
++        : []),
+       {
+         from: 'node_modules/agent-browser/bin/agent-browser-linux-${arch}',
+         to: 'agent-browser-linux-${arch}'
+@@ -562,16 +584,18 @@ module.exports = {
+       featureWallResources
+     ],
+     // Keep local artifacts aligned with the release pipeline.
+-    target: ['AppImage', 'deb', 'rpm'],
+-    maintainer: 'stablyai',
++    target: isLinuxHardened ? ['deb'] : ['AppImage', 'deb', 'rpm'],
++    maintainer: isLinuxHardened ? 'ersh123' : 'stablyai',
+     category: 'Utility'
+   },
+   appImage: {
+     artifactName: isLinuxArm64Release ? 'orca-linux-arm64.${ext}' : 'orca-linux.${ext}'
+   },
+   deb: {
+-    packageName: 'orca-ide',
+-    artifactName: 'orca-ide_${version}_${arch}.${ext}',
++    packageName: isLinuxHardened ? 'orca-hardened' : 'orca-ide',
++    artifactName: isLinuxHardened
++      ? 'orca-hardened_${version}_${arch}.${ext}'
++      : 'orca-ide_${version}_${arch}.${ext}',
+     // Why: xvfb lets the bundled `orca serve` CLI run browser panes on a headless
+     // Linux host — Chromium needs a display server even for offscreen rendering,
+     // and serve starts Xvfb itself when present (see ensure-virtual-display.ts).
+@@ -617,12 +641,16 @@ module.exports = {
+   // on Intel Macs. The beforeBuild hook performs Orca's targeted rebuild and
+   // returns false so electron-builder does not rebuild optional cpu-features.
+   npmRebuild: true,
+-  publish: {
+-    provider: 'github',
+-    owner: 'stablyai',
+-    repo: devChannelRepo ?? 'orca',
+-    releaseType: devChannelRepo ? 'prerelease' : 'release'
+-  }
++  ...(isLinuxHardened
++    ? {}
++    : {
++        publish: {
++          provider: 'github',
++          owner: 'stablyai',
++          repo: devChannelRepo ?? 'orca',
++          releaseType: devChannelRepo ? 'prerelease' : 'release'
++        }
++      })
+ }
+ 
+ // Stamp the effective channel version where node-mode CLI code can read it.
+@@ -639,7 +667,7 @@ function chmodUnixCliLaunchers(resourcesDir, electronPlatformName) {
+   if (electronPlatformName === 'win32') {
+     return
+   }
+-  for (const launcherName of ['orca', 'orca-ide']) {
++  for (const launcherName of ['orca', 'orca-ide', 'orca-hardened']) {
+     const launcherPath = join(resourcesDir, 'bin', launcherName)
+     if (!existsSync(launcherPath)) {
+       continue
+diff --git a/config/scripts/build-linux-hardened.test.mjs b/config/scripts/build-linux-hardened.test.mjs
+new file mode 100644
+index 00000000..17c57510
+--- /dev/null
++++ b/config/scripts/build-linux-hardened.test.mjs
+@@ -0,0 +1,70 @@
++import { mkdtempSync, readFileSync, rmSync } from 'node:fs'
++import { tmpdir } from 'node:os'
++import { join } from 'node:path'
++import { afterEach, describe, expect, it, vi } from 'vitest'
++import {
++  buildLinuxElectronBuilderArgs,
++  runLocalLinuxBuild,
++  writeHardenedBuildManifest
++} from './build-linux-local.mjs'
++
++const tempDirs = []
++afterEach(() => {
++  for (const dir of tempDirs.splice(0)) rmSync(dir, { recursive: true, force: true })
++})
++
++describe('hardened Linux local build', () => {
++  it('requests only a Debian artifact', () => {
++    const args = buildLinuxElectronBuilderArgs('x64', [], true)
++    expect(args).toEqual(
++      expect.arrayContaining(['--config', 'config/electron-builder.config.cjs', '--linux', 'deb', '--x64'])
++    )
++    expect(args).not.toContain('AppImage')
++    expect(args).not.toContain('rpm')
++  })
++
++  it('writes reproducible build identity before invoking electron-builder', () => {
++    const cwd = mkdtempSync(join(tmpdir(), 'orca-hardened-build-'))
++    tempDirs.push(cwd)
++    const execFile = vi.fn()
++    const environment = {
++      PATH: '/bin',
++      ORCA_HARDENED_LINUX: '1',
++      ORCA_HARDENED_UPSTREAM_SHA: 'abc123',
++      ORCA_HARDENED_BUILD_RUN: '42',
++      ORCA_LOCAL_BUILD_VERSION: '1.4.197-hardened.1'
++    }
++
++    runLocalLinuxBuild({ arch: 'x64', environment, execFile, platform: 'linux', cwd })
++
++    expect(execFile).toHaveBeenCalledWith(
++      'pnpm',
++      buildLinuxElectronBuilderArgs('x64', [], true),
++      expect.objectContaining({ cwd, env: expect.objectContaining(environment), stdio: 'inherit' })
++    )
++    expect(
++      JSON.parse(
++        readFileSync(join(cwd, 'resources/linux/packaging/build-manifest.json'), 'utf8')
++      )
++    ).toEqual({
++      product: 'Orca Hardened',
++      upstream: 'stablyai/orca',
++      upstreamSha: 'abc123',
++      buildRun: '42',
++      version: '1.4.197-hardened.1'
++    })
++  })
++
++  it('can write the manifest directly for release tooling', () => {
++    const cwd = mkdtempSync(join(tmpdir(), 'orca-hardened-manifest-'))
++    tempDirs.push(cwd)
++    writeHardenedBuildManifest(cwd, {
++      ORCA_HARDENED_UPSTREAM_SHA: 'sha',
++      ORCA_HARDENED_BUILD_RUN: 'run',
++      ORCA_LOCAL_BUILD_VERSION: 'version'
++    })
++    expect(readFileSync(join(cwd, 'resources/linux/packaging/build-manifest.json'), 'utf8')).toContain(
++      '"upstreamSha": "sha"'
++    )
++  })
++})
+diff --git a/config/scripts/build-linux-local.mjs b/config/scripts/build-linux-local.mjs
+index 2328f00b..9c162839 100644
+--- a/config/scripts/build-linux-local.mjs
++++ b/config/scripts/build-linux-local.mjs
+@@ -1,6 +1,7 @@
+ #!/usr/bin/env node
+ 
+ import { execFileSync } from 'node:child_process'
++import { mkdirSync, writeFileSync } from 'node:fs'
+ import { resolve } from 'node:path'
+ 
+ const SUPPORTED_ARCHES = new Set(['x64', 'arm64'])
+@@ -20,7 +21,11 @@ export function resolveLinuxBuildArch({
+   return arch
+ }
+ 
+-export function buildLinuxElectronBuilderArgs(arch, extraArgs = []) {
++export function buildLinuxElectronBuilderArgs(
++  arch,
++  extraArgs = [],
++  hardened = process.env.ORCA_HARDENED_LINUX === '1'
++) {
+   if (!SUPPORTED_ARCHES.has(arch)) {
+     throw new Error(`Unsupported Linux build architecture: ${arch}`)
+   }
+@@ -30,9 +35,7 @@ export function buildLinuxElectronBuilderArgs(arch, extraArgs = []) {
+     '--config',
+     'config/electron-builder.config.cjs',
+     '--linux',
+-    'AppImage',
+-    'deb',
+-    'rpm',
++    ...(hardened ? ['deb'] : ['AppImage', 'deb', 'rpm']),
+     `--${arch}`,
+     ...extraArgs
+   ]
+@@ -52,14 +55,38 @@ export function runLocalLinuxBuild({
+   } else {
+     delete env.ORCA_LINUX_ARM64_RELEASE
+   }
++  if (env.ORCA_HARDENED_LINUX === '1') {
++    writeHardenedBuildManifest(cwd, env)
++  }
+   const pnpm = platform === 'win32' ? 'pnpm.cmd' : 'pnpm'
+-  execFile(pnpm, buildLinuxElectronBuilderArgs(arch, extraArgs), {
++  execFile(pnpm, buildLinuxElectronBuilderArgs(arch, extraArgs, env.ORCA_HARDENED_LINUX === '1'), {
+     cwd,
+     env,
+     stdio: 'inherit'
+   })
+ }
+ 
