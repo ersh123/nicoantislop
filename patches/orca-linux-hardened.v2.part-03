@@ -1,0 +1,145 @@
++    terminateOwnedTree: () => 'unavailable',
++    signal() {},
++    onData() {},
++    onExit(cb) {
++      onExit = cb
++    },
++    dispose() {}
++  }
++}
++
++describe('TerminalHost spawn admission integration', () => {
++  it('releases the pending-start reservation after a spawn failure', async () => {
++    const admission = policy({ maxConcurrentStarts: 1 })
++    const spawn = vi.fn().mockRejectedValueOnce(new Error('spawn failed')).mockReturnValueOnce(
++      mockSubprocess(2)
++    )
++    const host = new TerminalHost({ spawnSubprocess: spawn, spawnAdmission: admission })
++    const create = (sessionId: string) =>
++      host.createOrAttach({
++        sessionId,
++        cols: 80,
++        rows: 24,
++        streamClient: { onData() {}, onExit() {} }
++      })
++
++    await expect(create('failed')).rejects.toThrow('spawn failed')
++    await expect(create('next')).resolves.toMatchObject({ isNew: true, pid: 2 })
++    expect(admission.snapshot().pendingStarts).toBe(0)
++  })
++
++  it('does not reserve another start when attaching to an existing session', async () => {
++    const admission = policy({ maxConcurrentStarts: 1 })
++    const host = new TerminalHost({
++      spawnSubprocess: () => mockSubprocess(3),
++      spawnAdmission: admission
++    })
++    const input = {
++      sessionId: 'same',
++      cols: 80,
++      rows: 24,
++      streamClient: { onData() {}, onExit() {} }
++    }
++
++    await host.createOrAttach(input)
++    await host.createOrAttach(input)
++
++    expect(admission.snapshot()).toMatchObject({ pendingStarts: 0, pendingExplicitAgents: 0 })
++  })
++})
+diff --git a/src/main/runtime/orchestration/worker-terminal-auto-release.test.ts b/src/main/runtime/orchestration/worker-terminal-auto-release.test.ts
+new file mode 100644
+index 00000000..47ecbf26
+--- /dev/null
++++ b/src/main/runtime/orchestration/worker-terminal-auto-release.test.ts
+@@ -0,0 +1,139 @@
++import { describe, expect, it, vi } from 'vitest'
++import { requestReclaimableWorkerTerminalReleases } from './worker-terminal-auto-release'
++import type { WorkerTerminalResourceRow } from './worker-terminal-ownership'
++
++function resource(
++  overrides: Partial<WorkerTerminalResourceRow> = {}
++): WorkerTerminalResourceRow {
++  return {
++    id: 'resource-1',
++    origin_dispatch_id: 'dispatch-1',
++    owner_dispatch_id: 'dispatch-1',
++    prior_owner_dispatch_ids: '[]',
++    worktree_id: 'worktree-1',
++    terminal_handle: 'term-1',
++    pane_key: 'tab-1:1',
++    process_incarnation: 'pid:1:start:1',
++    host_scope: 'local',
++    ownership_state: 'owned',
++    release_state: 'not_requested',
++    retained_reason: null,
++    release_requested_at: null,
++    release_completed_at: null,
++    release_error: null,
++    archive_source: null,
++    archive_status: null,
++    created_at: '2026-09-05 00:00:00',
++    updated_at: '2026-09-05 00:00:00',
++    ...overrides
++  }
++}
++
++function row(
++  dispatchId: string,
++  terminalState: 'active' | 'reclaimable' | 'retained' | 'release_pending' | 'release_unknown' | 'released',
++  overrides: Record<string, unknown> = {}
++) {
++  return {
++    dispatchId,
++    taskId: `task-${dispatchId}`,
++    runId: 'run-1',
++    workerState: 'succeeded' as const,
++    dispatchStatus: 'completed' as const,
++    agentTerminalHandle: `term-${dispatchId}`,
++    terminalState,
++    resource: resource({
++      id: `resource-${dispatchId}`,
++      origin_dispatch_id: dispatchId,
++      owner_dispatch_id: dispatchId,
++      terminal_handle: `term-${dispatchId}`
++    }),
++    ...overrides
++  }
++}
++
++describe('requestReclaimableWorkerTerminalReleases', () => {
++  it('requests release for settled coordinator-owned reclaimable workers', () => {
++    const requestWorkerTerminalRelease = vi.fn(() => ({
++      disposition: 'requested' as const,
++      resource: resource()
++    }))
++    const db = {
++      listWorkerTerminalResources: () => [
++        row('success', 'reclaimable'),
++        row('failure', 'reclaimable', { workerState: 'failed' as const })
++      ],
++      requestWorkerTerminalRelease
++    }
++
++    const result = requestReclaimableWorkerTerminalReleases(db)
++
++    expect(requestWorkerTerminalRelease.mock.calls).toEqual([['success'], ['failure']])
++    expect(result).toEqual({ examined: 2, requested: 2, retained: 0, failed: 0 })
++  })
++
++  it('never invents release intent for retained, active, external, or user-owned resources', () => {
++    const requestWorkerTerminalRelease = vi.fn()
++    const db = {
++      listWorkerTerminalResources: () => [
++        row('active', 'active'),
++        row('retained', 'retained'),
++        row('external', 'reclaimable', {
++          resource: resource({ ownership_state: 'external', retained_reason: 'external_terminal' })
++        }),
++        row('user', 'reclaimable', {
++          resource: resource({ ownership_state: 'user_owned', retained_reason: 'user_takeover' })
++        })
++      ],
++      requestWorkerTerminalRelease
++    }
++
