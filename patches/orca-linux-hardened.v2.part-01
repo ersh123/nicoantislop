@@ -1,0 +1,145 @@
++      nonce: 'n1',
++      runProcess
++    })
++    const second = await createLinuxTerminalProcessBoundary({
++      enabled: true,
++      sessionId: 'term-2',
++      shellPath: '/bin/zsh',
++      shellArgs: ['-l'],
++      nonce: 'n2',
++      runProcess
++    })
++
++    expect(first).not.toBeNull()
++    expect(second).not.toBeNull()
++    expect(runProcess.mock.calls.filter(([spec]) => spec.args?.[1] === 'show-environment')).toHaveLength(
++      1
++    )
++
++    await first?.terminate('SIGTERM')
++    await first?.terminate('SIGTERM')
++    await first?.terminate('SIGKILL')
++
++    const killCalls = runProcess.mock.calls.filter(([spec]) => spec.args?.[1] === 'kill')
++    expect(killCalls).toHaveLength(2)
++    expect(killCalls[0]?.[0]).toMatchObject({
++      program: 'systemctl',
++      args: [
++        '--user',
++        'kill',
++        '--kill-whom=all',
++        '--signal=SIGTERM',
++        first?.unitName
++      ]
++    })
++    expect(killCalls[1]?.[0]).toMatchObject({
++      args: ['--user', 'kill', '--kill-whom=all', '--signal=SIGKILL', first?.unitName]
++    })
++  })
++
++  it('reports an unverified boundary kill instead of inventing process exit', async () => {
++    resetLinuxTerminalBoundarySupportForTests()
++    const runProcess = vi
++      .fn()
++      .mockResolvedValueOnce(success)
++      .mockResolvedValueOnce({ ...success, code: 1, stderr: 'unit not loaded' })
++    const boundary = await createLinuxTerminalProcessBoundary({
++      enabled: true,
++      sessionId: 'term-1',
++      shellPath: '/bin/bash',
++      shellArgs: ['-l'],
++      nonce: 'n1',
++      runProcess
++    })
++
++    await expect(boundary?.terminate('SIGTERM')).resolves.toBe('unverifiable')
++  })
++})
+diff --git a/src/main/daemon/terminal-session-owned-tree-teardown.test.ts b/src/main/daemon/terminal-session-owned-tree-teardown.test.ts
+new file mode 100644
+index 00000000..024d2f5f
+--- /dev/null
++++ b/src/main/daemon/terminal-session-owned-tree-teardown.test.ts
+@@ -0,0 +1,101 @@
++import { beforeEach, describe, expect, it, vi } from 'vitest'
++import { TerminalSessionTeardown } from './terminal-session-teardown'
++import type { Session } from './session'
++
++const killWithDescendantSweepMock = vi.hoisted(() => vi.fn())
++vi.mock('../pty-descendant-termination', () => ({
++  killWithDescendantSweep: killWithDescendantSweepMock
++}))
++
++type MutableSession = Session & { isAlive: boolean; isTerminating: boolean }
++
++function session(overrides: Partial<Session> = {}): MutableSession {
++  return {
++    launchAgent: null,
++    pid: 4321,
++    isAlive: true,
++    isTerminating: false,
++    beginTermination: vi.fn(function (this: MutableSession) {
++      if (this.isTerminating) return false
++      this.isTerminating = true
++      return true
++    }),
++    terminateOwnedBoundary: vi.fn(async () => 'terminated' as const),
++    terminateOwnedTree: vi.fn(() => 'unavailable' as const),
++    scheduleForceDisposeFallback: vi.fn(),
++    signalTerminationRoot: vi.fn(),
++    forceKillAndWaitForExit: vi.fn(async () => {}),
++    ...overrides
++  } as unknown as MutableSession
++}
++
++describe('TerminalSessionTeardown owned-tree policy', () => {
++  beforeEach(() => {
++    killWithDescendantSweepMock.mockReset()
++    killWithDescendantSweepMock.mockImplementation(
++      async (_pid: number, signalRoot: () => void) => signalRoot()
++    )
++  })
++
++  it('captures descendants for a hand-typed agent whose launchAgent is null', async () => {
++    const target = session({ launchAgent: null })
++    const teardown = new TerminalSessionTeardown(new Map([['s1', target]]))
++
++    await teardown.killSession('s1', target, false)
++
++    expect(killWithDescendantSweepMock).toHaveBeenCalledWith(
++      target.pid,
++      expect.any(Function),
++      expect.objectContaining({
++        ownsRoot: expect.any(Function),
++        terminateOwnedTree: expect.any(Function)
++      })
++    )
++    expect(target.terminateOwnedBoundary).toHaveBeenCalledWith('SIGTERM')
++    expect(target.signalTerminationRoot).toHaveBeenCalledOnce()
++    expect(target.scheduleForceDisposeFallback).toHaveBeenCalledOnce()
++  })
++
++  it('captures descendants for an ordinary plain shell too', async () => {
++    const target = session({ launchAgent: null })
++    const teardown = new TerminalSessionTeardown(new Map([['s1', target]]))
++
++    await teardown.killSession('s1', target, true)
++
++    expect(killWithDescendantSweepMock).toHaveBeenCalledOnce()
++    expect(target.terminateOwnedBoundary).toHaveBeenCalledWith('SIGKILL')
++    expect(target.forceKillAndWaitForExit).toHaveBeenCalledOnce()
++  })
++
++  it('joins repeated close requests and escalates the shared operation', async () => {
++    let releaseSweep: (() => void) | null = null
++    killWithDescendantSweepMock.mockImplementation(
++      () => new Promise<void>((resolve) => (releaseSweep = resolve))
++    )
++    const target = session()
++    const teardown = new TerminalSessionTeardown(new Map([['s1', target]]))
++
++    const graceful = teardown.killSession('s1', target, false) as Promise<void>
++    const immediate = teardown.requestImmediate('s1')
++
++    expect(immediate).toBe(graceful)
++    expect(killWithDescendantSweepMock).toHaveBeenCalledOnce()
