@@ -1,0 +1,260 @@
++      .mockImplementationOnce(() => {
++        throw new Error('database busy')
++      })
++      .mockReturnValue({ disposition: 'requested' as const, resource: resource() })
++    const db = {
++      listWorkerTerminalResources: () => [
++        row('one', 'reclaimable'),
++        row('two', 'reclaimable'),
++        row('three', 'reclaimable')
++      ],
++      requestWorkerTerminalRelease
++    }
++
++    const result = requestReclaimableWorkerTerminalReleases(db, { maxRequests: 2 })
++
++    expect(requestWorkerTerminalRelease.mock.calls).toEqual([['one'], ['two']])
++    expect(result).toEqual({ examined: 3, requested: 0, retained: 1, failed: 1 })
++  })
++})
+diff --git a/src/main/runtime/orchestration/worker-terminal-auto-release.ts b/src/main/runtime/orchestration/worker-terminal-auto-release.ts
+new file mode 100644
+index 00000000..0d5b7680
+--- /dev/null
++++ b/src/main/runtime/orchestration/worker-terminal-auto-release.ts
+@@ -0,0 +1,93 @@
++import type { DispatchStatus, WorkerDispatchState } from './types'
++import type {
++  WorkerTerminalListState,
++  WorkerTerminalResourceRow
++} from './worker-terminal-ownership'
++
++export type WorkerTerminalAutoReleaseResult = {
++  examined: number
++  requested: number
++  retained: number
++  failed: number
++}
++
++type WorkerTerminalAutoReleaseDb = {
++  listWorkerTerminalResources(): {
++    dispatchId: string
++    taskId: string
++    runId: string
++    workerState: WorkerDispatchState | 'unsupervised'
++    dispatchStatus: DispatchStatus
++    agentTerminalHandle: string | null
++    terminalState: WorkerTerminalListState | null
++    resource: WorkerTerminalResourceRow | null
++  }[]
++  requestWorkerTerminalRelease(dispatchId: string):
++    | { disposition: 'requested' | 'already_released'; resource: WorkerTerminalResourceRow }
++    | { disposition: 'retained'; resource: WorkerTerminalResourceRow | null; reason: string }
++}
++
++export function requestReclaimableWorkerTerminalReleases(
++  db: WorkerTerminalAutoReleaseDb,
++  options: { maxRequests?: number } = {}
++): WorkerTerminalAutoReleaseResult {
++  let rows: ReturnType<WorkerTerminalAutoReleaseDb['listWorkerTerminalResources']>
++  try {
++    rows = db.listWorkerTerminalResources()
++  } catch (error) {
++    console.warn('[orchestration] automatic worker terminal inventory failed', error)
++    return { examined: 0, requested: 0, retained: 0, failed: 1 }
++  }
++
++  const result: WorkerTerminalAutoReleaseResult = {
++    examined: rows.length,
++    requested: 0,
++    retained: 0,
++    failed: 0
++  }
++  const maxRequests = positiveInteger(options.maxRequests, 8)
++  let attempted = 0
++  for (const row of rows) {
++    if (attempted >= maxRequests || !isAutoReleasable(row)) {
++      continue
++    }
++    attempted += 1
++    try {
++      const release = db.requestWorkerTerminalRelease(row.dispatchId)
++      if (release.disposition === 'requested' || release.disposition === 'already_released') {
++        result.requested += 1
++      } else {
++        result.retained += 1
++      }
++    } catch (error) {
++      result.failed += 1
++      console.warn('[orchestration] automatic worker terminal release request failed', {
++        dispatchId: row.dispatchId,
++        error: error instanceof Error ? error.message : String(error)
++      })
++    }
++  }
++  return result
++}
++
++function isAutoReleasable(row: {
++  workerState: WorkerDispatchState | 'unsupervised'
++  terminalState: WorkerTerminalListState | null
++  resource: WorkerTerminalResourceRow | null
++}): boolean {
++  const resource = row.resource
++  return Boolean(
++    resource &&
++      row.terminalState === 'reclaimable' &&
++      (row.workerState === 'succeeded' || row.workerState === 'failed') &&
++      resource.ownership_state === 'owned' &&
++      resource.release_state === 'not_requested' &&
++      resource.retained_reason === null
++  )
++}
++
++function positiveInteger(value: number | undefined, fallback: number): number {
++  return typeof value === 'number' && Number.isFinite(value) && value > 0
++    ? Math.floor(value)
++    : fallback
++}
+diff --git a/src/main/runtime/orchestration/worker-terminal-release-reconciliation.ts b/src/main/runtime/orchestration/worker-terminal-release-reconciliation.ts
+index 86a10ed0..2f32c554 100644
+--- a/src/main/runtime/orchestration/worker-terminal-release-reconciliation.ts
++++ b/src/main/runtime/orchestration/worker-terminal-release-reconciliation.ts
+@@ -1,5 +1,6 @@
+ import type { OrcaRuntimeService } from '../orca-runtime'
+ import { completeWorkerTerminalRelease } from '../rpc/methods/orchestration-worker-release-completion'
++import { requestReclaimableWorkerTerminalReleases } from './worker-terminal-auto-release'
+ 
+ export type WorkerTerminalReleaseReconciliationResult = {
+   attempted: number
+@@ -16,9 +17,8 @@ type ActiveReconciliation = {
+ 
+ const activeReconciliationByRuntime = new WeakMap<OrcaRuntimeService, ActiveReconciliation>()
+ 
+-// Finishes ONLY previously requested releases after startup/reconnect terminal discovery.
+-// It never invents release intent: resources outside requested/releasing are untouched, and
+-// unresolved identity defers (release_pending) rather than settling or broadening the close.
++// Requests eligible settled owned workers, then finishes durable release requests after
++// startup/reconnect discovery. Identity uncertainty remains retained or release_pending.
+ export function reconcileRequestedWorkerTerminalReleases(
+   runtime: OrcaRuntimeService
+ ): Promise<WorkerTerminalReleaseReconciliationResult> {
+@@ -63,6 +63,10 @@ async function reconcileRequestedWorkerTerminalReleasesOnce(
+   runtime: OrcaRuntimeService
+ ): Promise<WorkerTerminalReleaseReconciliationResult> {
+   const db = runtime.getOrchestrationDb()
++  const autoRelease = requestReclaimableWorkerTerminalReleases(db)
++  if (autoRelease.requested > 0 || autoRelease.retained > 0 || autoRelease.failed > 0) {
++    console.info('[orchestration] automatic worker terminal release requests', autoRelease)
++  }
+   const backlog = db.listWorkerTerminalReleaseBacklog()
+   const result = { ...emptyResult(), attempted: backlog.length }
+   for (const resource of backlog) {
+diff --git a/src/main/runtime/rpc/methods/orchestration-check-direct.ts b/src/main/runtime/rpc/methods/orchestration-check-direct.ts
+index 1ac5ddeb..f6708e09 100644
+--- a/src/main/runtime/rpc/methods/orchestration-check-direct.ts
++++ b/src/main/runtime/rpc/methods/orchestration-check-direct.ts
+@@ -3,6 +3,7 @@ import type { OrcaRuntimeService } from '../../orca-runtime'
+ import { OrchestrationError } from '../../orchestration/orchestration-error'
+ import { formatMessageBanner } from '../../orchestration/formatter'
+ import { reconcileLifecycleMessage } from '../../orchestration/lifecycle-reconciliation'
++import { reconcileRequestedWorkerTerminalReleases } from '../../orchestration/worker-terminal-release-reconciliation'
+ import { ORCHESTRATION_LEGACY_RUN_ID } from '../../../../shared/orchestration-rpc-contract'
+ import type { CheckParams } from './orchestration-schemas'
+ import type { z } from 'zod'
+@@ -38,13 +39,25 @@ export async function checkDirectMailbox(args: {
+     let visibleMessages = messages
+     if (consumeUnread && messages.length > 0) {
+       // Why: unread check is an authoritative read path for worker_done/heartbeat, so reconcile lifecycle messages here too.
++      let workerReleaseRequested = false
+       visibleMessages = messages.map((message) => {
+         const reconciled = reconcileLifecycleMessage(db, message)
++        if (
++          message.type === 'worker_done' &&
++          (reconciled.action === 'completed' || reconciled.action === 'failed')
++        ) {
++          workerReleaseRequested = true
++        }
+         return reconciled.action === 'rejected'
+           ? (db.getMessageById(message.id) ?? message)
+           : message
+       })
+       db.markAsRead(messages.map((message) => message.id))
++      if (workerReleaseRequested) {
++        void reconcileRequestedWorkerTerminalReleases(runtime).catch((error) => {
++          console.warn('[orchestration] automatic worker release completion failed', error)
++        })
++      }
+     }
+     if (params.format || params.inject) {
+       const formatted = visibleMessages.map(formatMessageBanner).join('\n\n')
+diff --git a/src/main/runtime/rpc/methods/orchestration-send-point-to-point.ts b/src/main/runtime/rpc/methods/orchestration-send-point-to-point.ts
+index 827b90b8..e04511c9 100644
+--- a/src/main/runtime/rpc/methods/orchestration-send-point-to-point.ts
++++ b/src/main/runtime/rpc/methods/orchestration-send-point-to-point.ts
+@@ -1,6 +1,7 @@
+ import type { MessagePriority, MessageType, OrchestrationDb } from '../../orchestration/db'
+ import type { OrcaRuntimeService } from '../../orca-runtime'
+ import { reconcileLifecycleMessage } from '../../orchestration/lifecycle-reconciliation'
++import { reconcileRequestedWorkerTerminalReleases } from '../../orchestration/worker-terminal-release-reconciliation'
+ import { bindCoordinatorMutationPayload } from '../../orchestration/dispatch-message-binding'
+ import { isDispatchMutationMessageType, parseMessageTaskId } from './orchestration-schemas'
+ import type { SendParams } from './orchestration-schemas'
+@@ -104,6 +105,14 @@ export function sendPointToPointMessage(args: {
+       return withSendWarnings({ message: rejection, lifecycle: reconciled })
+     }
+     runtime.notifyMessageArrived(msg.to_handle, msg.type)
++    if (
++      msg.type === 'worker_done' &&
++      (reconciled.action === 'completed' || reconciled.action === 'failed')
++    ) {
++      void reconcileRequestedWorkerTerminalReleases(runtime).catch((error) => {
++        console.warn('[orchestration] automatic worker release completion failed', error)
++      })
++    }
+     return withSendWarnings(
+       msg.type === 'worker_done' ? { message: msg, lifecycle: reconciled } : { message: msg }
+     )
+diff --git a/src/main/updater/updater-setup.ts b/src/main/updater/updater-setup.ts
+index d60444d4..dbf4d8cc 100644
+--- a/src/main/updater/updater-setup.ts
++++ b/src/main/updater/updater-setup.ts
+@@ -20,6 +20,7 @@ import { recordUpdaterLifecycle } from '../updater-lifecycle-diagnostics'
+ import { AUTO_UPDATE_CHECK_INTERVAL_MS } from './updater-state'
+ import { UpdaterDownloadInstall } from './updater-download-install'
+ import type { UpdateInstallMode } from './updater-state'
++import { isHardenedLinuxRuntime } from '../daemon/linux-terminal-process-boundary'
+ 
+ export type UpdaterSetupOptions = {
+   getLastUpdateCheckAt?: () => number | null
+@@ -36,19 +37,27 @@ export type UpdaterSetupOptions = {
+ /** Initializes electron-updater and attaches lifecycle/event bridges. */
+ export class UpdaterSetup extends UpdaterDownloadInstall {
+   checkForUpdates(): void {
+-    this.checkForUpdatesInBackground()
++    if (!isHardenedLinuxRuntime()) {
++      this.checkForUpdatesInBackground()
++    }
+   }
+ 
+   checkForUpdatesFromMenu(options?: UpdateCheckOptions): void {
+-    super.checkForUpdatesFromMenu(options)
++    if (!isHardenedLinuxRuntime()) {
++      super.checkForUpdatesFromMenu(options)
++    }
+   }
+ 
+   downloadUpdate(): void {
+-    super.downloadUpdate()
++    if (!isHardenedLinuxRuntime()) {
++      super.downloadUpdate()
++    }
+   }
+ 
+   quitAndInstall(): void {
+-    super.quitAndInstall()
++    if (!isHardenedLinuxRuntime()) {
++      super.quitAndInstall()
++    }
+   }
+ 
