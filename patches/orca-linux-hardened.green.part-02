@@ -1,0 +1,260 @@
++{
++  "product": "Orca Hardened",
++  "upstream": "stablyai/orca",
++  "upstreamSha": "development",
++  "buildRun": "local",
++  "version": "development"
++}
+diff --git a/resources/linux/packaging/orca-hardened-agents.slice b/resources/linux/packaging/orca-hardened-agents.slice
+new file mode 100644
+index 00000000..c410d6a0
+--- /dev/null
++++ b/resources/linux/packaging/orca-hardened-agents.slice
+@@ -0,0 +1,13 @@
++[Unit]
++Description=Orca Hardened agent workloads
++Documentation=https://github.com/ersh123/nicoantislop
++
++[Slice]
++CPUAccounting=yes
++MemoryAccounting=yes
++TasksAccounting=yes
++MemoryHigh=80%
++MemoryMax=90%
++MemorySwapMax=50%
++TasksMax=2048
++ManagedOOMMemoryPressure=kill
+diff --git a/src/main/daemon/daemon-server.ts b/src/main/daemon/daemon-server.ts
+index 21514b0a..8b727f8c 100644
+--- a/src/main/daemon/daemon-server.ts
++++ b/src/main/daemon/daemon-server.ts
+@@ -21,6 +21,8 @@ import { DaemonTerminalAdmission } from './daemon-terminal-admission'
+ import { checkPtySpawnHealth } from './pty-subprocess'
+ import { TerminalHistorySeedTransferRegistry } from './terminal-history-seed-transfer-registry'
+ import { TerminalHost } from './terminal-host'
++import { createHardenedTerminalSpawnAdmission } from './terminal-spawn-admission'
++import { isHardenedLinuxRuntime } from './linux-terminal-process-boundary'
+ import {
+   CLEAN_DISCONNECT_PROTOCOL_VERSION,
+   NOTIFY_PREFIX,
+@@ -50,6 +52,9 @@ export class DaemonServer {
+     this.log = options.log ?? createNoopDaemonFileLog()
+     this.host = new TerminalHost({
+       spawnSubprocess: options.spawnSubprocess,
++      ...(isHardenedLinuxRuntime()
++        ? { spawnAdmission: createHardenedTerminalSpawnAdmission() }
++        : {}),
+       reportReadinessEvent: (event, details) => this.log.log(event, details),
+       onSessionReaped: (sessionId) => {
+         this.attachments.release(sessionId)
+diff --git a/src/main/daemon/linux-terminal-process-boundary.test.ts b/src/main/daemon/linux-terminal-process-boundary.test.ts
+new file mode 100644
+index 00000000..0972d62b
+--- /dev/null
++++ b/src/main/daemon/linux-terminal-process-boundary.test.ts
+@@ -0,0 +1,129 @@
++import { describe, expect, it, vi } from 'vitest'
++import {
++  buildLinuxTerminalScopeLaunch,
++  createLinuxTerminalProcessBoundary,
++  isHardenedLinuxRuntime,
++  resetLinuxTerminalBoundarySupportForTests
++} from './linux-terminal-process-boundary'
++
++const success = { code: 0, signal: null, stdout: '', stderr: '', timedOut: false }
++
++describe('Linux terminal process boundary', () => {
++  it('builds argv without shell concatenation and preserves user-shell arguments', () => {
++    const plan = buildLinuxTerminalScopeLaunch({
++      sessionId: 'term / unsafe $ id',
++      nonce: 'ABC-123',
++      shellPath: '/bin/bash',
++      shellArgs: ['-l', '-c', 'printf "%s" "$HOME"']
++    })
++
++    expect(plan.unitName).toMatch(/^orca-hardened-terminal-[a-f0-9]{16}-abc123\.scope$/)
++    expect(plan.shellPath).toBe('systemd-run')
++    expect(plan.shellArgs.slice(-5)).toEqual([
++      '--',
++      '/bin/bash',
++      '-l',
++      '-c',
++      'printf "%s" "$HOME"'
++    ])
++    expect(plan.shellArgs).toContain('--slice=orca-hardened-agents.slice')
++    expect(plan.shellArgs).toContain('--property=KillMode=control-group')
++  })
++
++  it('gates hardened behavior to Linux plus explicit build identity', () => {
++    expect(
++      isHardenedLinuxRuntime({ platform: 'linux', execPath: '/opt/Orca Hardened/orca-hardened' })
++    ).toBe(true)
++    expect(
++      isHardenedLinuxRuntime({
++        platform: 'linux',
++        execPath: '/opt/Orca/orca-ide',
++        env: { ORCA_HARDENED_LINUX: '1' }
++      })
++    ).toBe(true)
++    expect(
++      isHardenedLinuxRuntime({ platform: 'linux', execPath: '/opt/Orca/orca-ide', env: {} })
++    ).toBe(false)
++    expect(
++      isHardenedLinuxRuntime({ platform: 'darwin', execPath: '/Applications/orca-hardened' })
++    ).toBe(false)
++  })
++
++  it('returns null when the user systemd manager is unavailable', async () => {
++    resetLinuxTerminalBoundarySupportForTests()
++    const runProcess = vi.fn().mockResolvedValue({ ...success, code: 1, stderr: 'no bus' })
++
++    const boundary = await createLinuxTerminalProcessBoundary({
++      enabled: true,
++      sessionId: 'term-1',
++      shellPath: '/bin/bash',
++      shellArgs: ['-l'],
++      nonce: 'n1',
++      runProcess
++    })
++
++    expect(boundary).toBeNull()
++    expect(runProcess).toHaveBeenCalledWith(
++      expect.objectContaining({ program: 'systemctl', args: ['--user', 'show-environment'] })
++    )
++  })
++
++  it('caches the support probe and terminates its unique scope idempotently', async () => {
++    resetLinuxTerminalBoundarySupportForTests()
++    const runProcess = vi.fn().mockResolvedValue(success)
++    const first = await createLinuxTerminalProcessBoundary({
++      enabled: true,
++      sessionId: 'term-1',
++      shellPath: '/bin/bash',
++      shellArgs: ['-l'],
++      nonce: 'n1',
++      runProcess
++    })
++    const second = await createLinuxTerminalProcessBoundary({
++      enabled: true,
++      sessionId: 'term-2',
++      shellPath: '/bin/zsh',
++      shellArgs: ['-l'],
++      nonce: 'n2',
++      runProcess
++    })
++
++    expect(first).not.toBeNull()
++    expect(second).not.toBeNull()
++    expect(
++      runProcess.mock.calls.filter(([spec]) => spec.args?.[1] === 'show-environment')
++    ).toHaveLength(1)
++
++    await first?.terminate('SIGTERM')
++    await first?.terminate('SIGTERM')
++    await first?.terminate('SIGKILL')
++
++    const killCalls = runProcess.mock.calls.filter(([spec]) => spec.args?.[1] === 'kill')
++    expect(killCalls).toHaveLength(2)
++    expect(killCalls[0]?.[0]).toMatchObject({
++      program: 'systemctl',
++      args: ['--user', 'kill', '--kill-whom=all', '--signal=SIGTERM', first?.unitName]
++    })
++    expect(killCalls[1]?.[0]).toMatchObject({
++      args: ['--user', 'kill', '--kill-whom=all', '--signal=SIGKILL', first?.unitName]
++    })
++  })
++
++  it('reports an unverified boundary kill instead of inventing process exit', async () => {
++    resetLinuxTerminalBoundarySupportForTests()
++    const runProcess = vi
++      .fn()
++      .mockResolvedValueOnce(success)
++      .mockResolvedValueOnce({ ...success, code: 1, stderr: 'unit not loaded' })
++    const boundary = await createLinuxTerminalProcessBoundary({
++      enabled: true,
++      sessionId: 'term-1',
++      shellPath: '/bin/bash',
++      shellArgs: ['-l'],
++      nonce: 'n1',
++      runProcess
++    })
++
++    await expect(boundary?.terminate('SIGTERM')).resolves.toBe('unverifiable')
++  })
++})
+diff --git a/src/main/daemon/linux-terminal-process-boundary.ts b/src/main/daemon/linux-terminal-process-boundary.ts
+new file mode 100644
+index 00000000..6bb8d590
+--- /dev/null
++++ b/src/main/daemon/linux-terminal-process-boundary.ts
+@@ -0,0 +1,161 @@
++import { createHash, randomUUID } from 'node:crypto'
++import { basename } from 'node:path'
++import { runProcess as defaultRunProcess } from '../../shared/child-process/run-process'
++
++export type LinuxTerminalBoundarySignal = 'SIGTERM' | 'SIGKILL'
++export type LinuxTerminalBoundaryTermination = 'terminated' | 'unverifiable'
++
++export type LinuxTerminalScopeLaunch = {
++  unitName: string
++  shellPath: string
++  shellArgs: string[]
++}
++
++export type LinuxTerminalProcessBoundary = LinuxTerminalScopeLaunch & {
++  terminate(signal: LinuxTerminalBoundarySignal): Promise<LinuxTerminalBoundaryTermination>
++}
++
++type RunProcess = typeof defaultRunProcess
++
++let supportProbe: Promise<boolean> | null = null
++
++export function isHardenedLinuxRuntime(input: {
++  platform?: NodeJS.Platform
++  execPath?: string
++  env?: NodeJS.ProcessEnv
++} = {}): boolean {
++  const platform = input.platform ?? process.platform
++  if (platform !== 'linux') {
++    return false
++  }
++  const env = input.env ?? process.env
++  return (
++    env.ORCA_HARDENED_LINUX === '1' ||
++    basename(input.execPath ?? process.execPath).toLowerCase() === 'orca-hardened'
++  )
++}
++
++export function buildLinuxTerminalScopeLaunch(input: {
++  sessionId: string
++  nonce: string
++  shellPath: string
++  shellArgs: readonly string[]
++  env?: NodeJS.ProcessEnv
++}): LinuxTerminalScopeLaunch {
++  const sessionHash = createHash('sha256').update(input.sessionId).digest('hex').slice(0, 16)
++  const nonce = normalizeUnitToken(input.nonce)
++  const unitName = `orca-hardened-terminal-${sessionHash}-${nonce}.scope`
++  const env = input.env ?? process.env
++  const memoryHigh = normalizedSystemdSize(env.ORCA_HARDENED_SCOPE_MEMORY_HIGH, '6G')
++  const memoryMax = normalizedSystemdSize(env.ORCA_HARDENED_SCOPE_MEMORY_MAX, '8G')
++  const tasksMax = normalizedPositiveInteger(env.ORCA_HARDENED_SCOPE_TASKS_MAX, 512)
++  return {
++    unitName,
++    shellPath: 'systemd-run',
++    shellArgs: [
++      '--user',
++      '--scope',
++      '--quiet',
++      '--collect',
++      `--unit=${unitName}`,
++      '--slice=orca-hardened-agents.slice',
++      '--property=KillMode=control-group',
++      '--property=MemoryAccounting=yes',
++      '--property=TasksAccounting=yes',
++      `--property=TasksMax=${tasksMax}`,
++      `--property=MemoryHigh=${memoryHigh}`,
++      `--property=MemoryMax=${memoryMax}`,
++      '--',
++      input.shellPath,
++      ...input.shellArgs
