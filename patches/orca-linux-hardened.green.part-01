@@ -1,0 +1,260 @@
+-  execFile(pnpm, buildLinuxElectronBuilderArgs(arch, extraArgs), {
++  execFile(pnpm, buildLinuxElectronBuilderArgs(arch, extraArgs, env.ORCA_HARDENED_LINUX === '1'), {
+     cwd,
+     env,
+     stdio: 'inherit'
+   })
+ }
+ 
++
++export function writeHardenedBuildManifest(cwd, environment = process.env) {
++  const output = resolve(cwd, 'resources/linux/packaging/build-manifest.json')
++  mkdirSync(resolve(cwd, 'resources/linux/packaging'), { recursive: true })
++  writeFileSync(
++    output,
++    `${JSON.stringify(
++      {
++        product: 'Orca Hardened',
++        upstream: 'stablyai/orca',
++        upstreamSha: environment.ORCA_HARDENED_UPSTREAM_SHA ?? 'unknown',
++        buildRun: environment.ORCA_HARDENED_BUILD_RUN ?? 'local',
++        version: environment.ORCA_LOCAL_BUILD_VERSION ?? 'development'
++      },
++      null,
++      2
++    )}
++`
++  )
++}
++
+ if (process.argv[1] && resolve(process.argv[1]) === resolve(import.meta.filename)) {
+   runLocalLinuxBuild({ extraArgs: process.argv.slice(2) })
+ }
+diff --git a/config/scripts/electron-builder-linux-hardened-config.test.mjs b/config/scripts/electron-builder-linux-hardened-config.test.mjs
+new file mode 100644
+index 00000000..cbd1dbb4
+--- /dev/null
++++ b/config/scripts/electron-builder-linux-hardened-config.test.mjs
+@@ -0,0 +1,70 @@
++import { createRequire } from 'node:module'
++import { describe, expect, it } from 'vitest'
++
++const require = createRequire(import.meta.url)
++
++function withHardenedConfig(assertion) {
++  const configPath = require.resolve('../electron-builder.config.cjs')
++  const keys = ['ORCA_HARDENED_LINUX', 'ORCA_LOCAL_BUILD_VERSION']
++  const original = Object.fromEntries(keys.map((key) => [key, process.env[key]]))
++  try {
++    process.env.ORCA_HARDENED_LINUX = '1'
++    process.env.ORCA_LOCAL_BUILD_VERSION = '1.4.197-hardened.1'
++    delete require.cache[configPath]
++    assertion(require('../electron-builder.config.cjs'))
++  } finally {
++    for (const [key, value] of Object.entries(original)) {
++      if (value === undefined) delete process.env[key]
++      else process.env[key] = value
++    }
++    delete require.cache[configPath]
++  }
++}
++
++describe('Orca Hardened Linux package contract', () => {
++  it('uses an independent identity and produces only one Debian artifact', () => {
++    withHardenedConfig((config) => {
++      expect(config.appId).toBe('com.ersh123.orca-hardened')
++      expect(config.productName).toBe('Orca Hardened')
++      expect(config.protocols).toEqual([
++        { name: 'Orca Hardened', schemes: ['orca-hardened'] }
++      ])
++      expect(config.linux.executableName).toBe('orca-hardened')
++      expect(config.linux.target).toEqual(['deb'])
++      expect(config.deb.packageName).toBe('orca-hardened')
++      expect(config.deb.artifactName).toBe('orca-hardened_${version}_${arch}.${ext}')
++      expect(config.extraMetadata).toEqual({ version: '1.4.197-hardened.1' })
++      expect(config.publish).toBeUndefined()
++    })
++  })
++
++  it('ships the user slice, hardened launcher, and build manifest', () => {
++    withHardenedConfig((config) => {
++      expect(config.linux.extraResources).toEqual(
++        expect.arrayContaining([
++          {
++            from: 'resources/linux/bin/orca-hardened',
++            to: 'bin/orca-hardened'
++          },
++          {
++            from: 'resources/linux/packaging/orca-hardened-agents.slice',
++            to: 'linux/packaging/orca-hardened-agents.slice'
++          },
++          {
++            from: 'resources/linux/packaging/build-manifest.json',
++            to: 'linux/packaging/build-manifest.json'
++          }
++        ])
++      )
++    })
++  })
++
++  it('keeps the upstream build identity unchanged outside hardened builds', () => {
++    const config = require('../electron-builder.config.cjs')
++    expect(config.appId).toBe('com.stablyai.orca')
++    expect(config.productName).toBe('Orca')
++    expect(config.linux.executableName).toBe('orca-ide')
++    expect(config.deb.packageName).toBe('orca-ide')
++    expect(config.publish).toMatchObject({ owner: 'stablyai', repo: 'orca' })
++  })
++})
+diff --git a/resources/linux/bin/orca-hardened b/resources/linux/bin/orca-hardened
+new file mode 100755
+index 00000000..d8a25117
+--- /dev/null
++++ b/resources/linux/bin/orca-hardened
+@@ -0,0 +1,32 @@
++#!/usr/bin/env bash
++set -euo pipefail
++
++SOURCE="${BASH_SOURCE[0]}"
++while [ -h "$SOURCE" ]; do
++  DIR="$(cd "$(dirname "$SOURCE")" >/dev/null 2>&1 && pwd)"
++  SOURCE="$(readlink "$SOURCE")"
++  [[ $SOURCE != /* ]] && SOURCE="$DIR/$SOURCE"
++done
++SCRIPT_DIR="$(cd "$(dirname "$SOURCE")" >/dev/null 2>&1 && pwd)"
++RESOURCES_DIR="$(cd "$SCRIPT_DIR/.." >/dev/null 2>&1 && pwd)"
++APP_DIR="$(cd "$RESOURCES_DIR/.." >/dev/null 2>&1 && pwd)"
++
++ELECTRON=""
++for candidate in orca-hardened "Orca Hardened" orca-ide; do
++  if [ -f "$APP_DIR/$candidate" ] && [ -x "$APP_DIR/$candidate" ]; then
++    ELECTRON="$APP_DIR/$candidate"
++    break
++  fi
++done
++if [ -z "$ELECTRON" ]; then
++  echo "Unable to locate the Orca Hardened executable next to $RESOURCES_DIR" >&2
++  exit 1
++fi
++
++CLI="$RESOURCES_DIR/app.asar.unpacked/out/cli/index.js"
++export ORCA_HARDENED_LINUX=1
++export ORCA_NODE_OPTIONS="${NODE_OPTIONS-}"
++export ORCA_NODE_REPL_EXTERNAL_MODULE="${NODE_REPL_EXTERNAL_MODULE-}"
++unset NODE_OPTIONS
++unset NODE_REPL_EXTERNAL_MODULE
++ELECTRON_RUN_AS_NODE=1 exec "$ELECTRON" "$CLI" "$@"
+diff --git a/resources/linux/packaging/after-install.sh b/resources/linux/packaging/after-install.sh
+index 06e77ecba..88a991de 100755
+--- a/resources/linux/packaging/after-install.sh
++++ b/resources/linux/packaging/after-install.sh
+@@ -1,21 +1,27 @@
+ #!/bin/bash
+-# Why: register the bundled `orca-ide` CLI on PATH at package-install time.
+-# The in-app "Install CLI" action (CliInstaller) can never run on a headless
+-# server, so without this symlink `orca serve` is unreachable from the shell on
+-# the exact hosts that need it most. deb/rpm both run this after unpacking.
+-#
+-# The shim resolves the real app by walking up from its own location, so a
+-# symlink works. We discover the install dir instead of hardcoding /opt/Orca
+-# because electron-builder's directory name can vary by productName sanitization.
+ set -e
+ 
++mode="upstream"
++launcher="orca-ide"
+ link="/usr/bin/orca-ide"
++install_dirs=(/opt/Orca /opt/orca-ide /opt/orca)
++
++for dir in "/opt/Orca Hardened" /opt/orca-hardened; do
++  if [ -x "$dir/resources/bin/orca-hardened" ]; then
++    mode="hardened"
++    launcher="orca-hardened"
++    link="/usr/bin/orca-hardened"
++    install_dirs=("/opt/Orca Hardened" /opt/orca-hardened)
++    break
++  fi
++done
+ 
+ is_owned_link() {
+   [ -L "$link" ] || return 1
+   local link_target candidate candidate_target
+   link_target="$(readlink -f -- "$link" 2>/dev/null || true)"
+-  for candidate in /opt/Orca/resources/bin/orca-ide /opt/orca-ide/resources/bin/orca-ide /opt/orca/resources/bin/orca-ide; do
++  for candidate in "${install_dirs[@]}"; do
++    candidate="$candidate/resources/bin/$launcher"
+     candidate_target="$(readlink -f -- "$candidate" 2>/dev/null || true)"
+     if [ -n "$candidate_target" ] && [ "$link_target" = "$candidate_target" ]; then
+       return 0
+@@ -24,20 +30,23 @@ is_owned_link() {
+   return 1
+ }
+ 
+-for dir in /opt/Orca /opt/orca-ide /opt/orca; do
++for dir in "${install_dirs[@]}"; do
+   sandbox="$dir/chrome-sandbox"
+   if [ -f "$sandbox" ]; then
+-    # Why: packaged Linux installs must leave Chromium's sandbox helper usable
+-    # on hosts where unprivileged user namespaces are unavailable.
+     chmod 4755 "$sandbox" || true
+   fi
+ 
+-  shim="$dir/resources/bin/orca-ide"
++  shim="$dir/resources/bin/$launcher"
+   if [ -x "$shim" ]; then
+-    # Only manage our own symlink; never clobber an unrelated /usr/bin/orca-ide.
+     if { [ ! -e "$link" ] && [ ! -L "$link" ]; } || is_owned_link; then
+       ln -sfn -- "$shim" "$link"
+     fi
++    if [ "$mode" = "hardened" ]; then
++      slice="$dir/resources/linux/packaging/orca-hardened-agents.slice"
++      if [ -f "$slice" ]; then
++        install -Dm0644 "$slice" /usr/lib/systemd/user/orca-hardened-agents.slice || true
++      fi
++    fi
+     break
+   fi
+ done
+diff --git a/resources/linux/packaging/after-remove.sh b/resources/linux/packaging/after-remove.sh
+index a23426df..cc06cd49 100755
+--- a/resources/linux/packaging/after-remove.sh
++++ b/resources/linux/packaging/after-remove.sh
+@@ -1,24 +1,25 @@
+ #!/bin/bash
+-# Why: remove the PATH symlink that after-install.sh created, but only if it
+-# still points into an Orca install dir — never delete an unrelated
+-# /usr/bin/orca-ide a user or other package may own.
+ set -e
+ 
+-# RPM passes an instance count; dpkg passes the package lifecycle action.
+ case "${1-}" in
+   0 | remove | purge) ;;
+   *) exit 0 ;;
+ esac
+ 
+-link="/usr/bin/orca-ide"
+-
+-if [ -L "$link" ]; then
++for link in /usr/bin/orca-hardened /usr/bin/orca-ide; do
++  if [ ! -L "$link" ]; then
++    continue
++  fi
+   target="$(readlink "$link" || true)"
+   case "$target" in
+-    /opt/Orca/*|/opt/orca-ide/*|/opt/orca/*)
++    /opt/Orca\ Hardened/*|/opt/orca-hardened/*|/opt/Orca/*|/opt/orca-ide/*|/opt/orca/*)
+       rm -f "$link"
+       ;;
+   esac
++done
++
++if [ "${1-}" = "purge" ] || [ "${1-}" = "0" ]; then
++  rm -f /usr/lib/systemd/user/orca-hardened-agents.slice || true
+ fi
+ 
+ exit 0
+diff --git a/resources/linux/packaging/build-manifest.json b/resources/linux/packaging/build-manifest.json
+new file mode 100644
+index 00000000..6d7e1dce
+--- /dev/null
++++ b/resources/linux/packaging/build-manifest.json
+@@ -0,0 +1,7 @@
