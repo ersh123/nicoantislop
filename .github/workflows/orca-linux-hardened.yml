@@ -32,6 +32,11 @@ jobs:
           curl --fail --location --retry 5 \
             "https://codeload.github.com/stablyai/orca/tar.gz/${ORCA_UPSTREAM_SHA}" \
             | tar -xz --strip-components=1 -C work/orca
+          shopt -s nullglob
+          parts=(patches/orca-linux-hardened.patch.part-*)
+          if [[ ${#parts[@]} -gt 0 ]]; then
+            cat "${parts[@]}" > patches/orca-linux-hardened.patch
+          fi
           if [[ -s patches/orca-linux-hardened.patch ]]; then
             git -C work/orca init -q
             git -C work/orca add -A
@@ -66,12 +71,12 @@ jobs:
         run: pnpm install --frozen-lockfile
 
       - name: Baseline daemon test
-        if: ${{ hashFiles('patches/orca-linux-hardened.patch') == '' }}
+        if: ${{ hashFiles('patches/orca-linux-hardened.patch.part-*') == '' }}
         working-directory: work/orca
         run: pnpm test src/main/daemon/terminal-session-teardown.test.ts
 
       - name: Hardened targeted gates
-        if: ${{ hashFiles('patches/orca-linux-hardened.patch') != '' }}
+        if: ${{ hashFiles('patches/orca-linux-hardened.patch.part-*') != '' }}
         working-directory: work/orca
         shell: bash
         run: |
@@ -95,7 +100,7 @@ jobs:
             src/main/runtime/orchestration/worker-terminal-auto-release.ts
 
       - name: Build hardened Debian package
-        if: ${{ hashFiles('patches/orca-linux-hardened.patch') != '' }}
+        if: ${{ hashFiles('patches/orca-linux-hardened.patch.part-*') != '' }}
         working-directory: work/orca
         env:
           ORCA_HARDENED_LINUX: '1'
@@ -105,7 +110,7 @@ jobs:
         run: pnpm run build:linux
 
       - name: Inspect Debian package
-        if: ${{ hashFiles('patches/orca-linux-hardened.patch') != '' }}
+        if: ${{ hashFiles('patches/orca-linux-hardened.patch.part-*') != '' }}
         shell: bash
         run: |
           cp scripts/verify-deb.sh work/orca/verify-deb.sh
@@ -113,7 +118,7 @@ jobs:
           bash verify-deb.sh
 
       - name: Upload release evidence
-        if: ${{ always() && hashFiles('patches/orca-linux-hardened.patch') != '' }}
+        if: ${{ always() && hashFiles('patches/orca-linux-hardened.patch.part-*') != '' }}
         uses: actions/upload-artifact@v4
         with:
           name: orca-hardened-linux-x64-${{ github.sha }}
