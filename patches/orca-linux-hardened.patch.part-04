@@ -1,0 +1,152 @@
+tWorkerTerminalResources: () => [
++        row('one', 'reclaimable'),
++        row('two', 'reclaimable'),
++        row('three', 'reclaimable')
++      ],
++      requestWorkerTerminalRelease
++    }
++
++    const result = requestReclaimableWorkerTerminalReleases(db, { maxRequests: 2 })
++
++    expect(requestWorkerTerminalRelease.mock.calls).toEqual([['one'], ['two']])
++    expect(result).toEqual({ examined: 3, requested: 0, retained: 1, failed: 1 })
++  })
++})
+diff --git a/src/renderer/src/components/native-chat/use-native-chat-composer-attachments-unmount.test.tsx b/src/renderer/src/components/native-chat/use-native-chat-composer-attachments-unmount.test.tsx
+new file mode 100644
+index 00000000..e8e2c55d
+--- /dev/null
++++ b/src/renderer/src/components/native-chat/use-native-chat-composer-attachments-unmount.test.tsx
+@@ -0,0 +1,70 @@
++// @vitest-environment happy-dom
++import { act, renderHook } from '@testing-library/react'
++import { afterEach, describe, expect, it, vi } from 'vitest'
++import { createRef } from 'react'
++import {
++  clearNativeChatAttachmentCacheForTests,
++  useNativeChatComposerAttachments
++} from './use-native-chat-composer-attachments'
++
++vi.mock('@/i18n/i18n', () => ({
++  translate: (_key: string, fallback: string) => fallback
++}))
++vi.mock('@/runtime/runtime-terminal-inspection', () => ({
++  isRemoteRuntimePtyId: () => false
++}))
++
++function renderAttachments() {
++  return renderHook(() =>
++    useNativeChatComposerAttachments({
++      attachmentScopeKey: 'pane-1',
++      caret: 0,
++      disabled: false,
++      isComposing: () => false,
++      resolveTarget: () => ({
++        ptyId: 'pty-1',
++        settings: { activeRuntimeEnvironmentId: null }
++      }),
++      textareaRef: createRef<HTMLTextAreaElement>(),
++      setCaret: () => {},
++      setDraft: () => {},
++      setNotice: () => {}
++    })
++  )
++}
++
++describe('native chat attachment preview lifetime', () => {
++  afterEach(() => {
++    clearNativeChatAttachmentCacheForTests()
++    vi.restoreAllMocks()
++  })
++
++  it('revokes a pending blob preview when the composer unmounts', () => {
++    const revoke = vi.spyOn(URL, 'revokeObjectURL').mockImplementation(() => undefined)
++    const view = renderAttachments()
++
++    act(() => {
++      view.result.current.beginPendingImageAttachment('blob:clipboard-preview')
++    })
++    view.unmount()
++
++    expect(revoke).toHaveBeenCalledTimes(1)
++    expect(revoke).toHaveBeenCalledWith('blob:clipboard-preview')
++  })
++
++  it('does not double-revoke a preview removed before unmount', () => {
++    const revoke = vi.spyOn(URL, 'revokeObjectURL').mockImplementation(() => undefined)
++    const view = renderAttachments()
++    let id: string | null = null
++
++    act(() => {
++      id = view.result.current.beginPendingImageAttachment('blob:clipboard-preview')
++    })
++    act(() => {
++      view.result.current.dropPendingImageAttachment(id as string)
++    })
++    view.unmount()
++
++    expect(revoke).toHaveBeenCalledTimes(1)
++  })
++})
+diff --git a/src/renderer/src/lib/terminal-worktree-renderability.test.ts b/src/renderer/src/lib/terminal-worktree-renderability.test.ts
+new file mode 100644
+index 00000000..b79eef82
+--- /dev/null
++++ b/src/renderer/src/lib/terminal-worktree-renderability.test.ts
+@@ -0,0 +1,59 @@
++import { describe, expect, it } from 'vitest'
++import type { AppState } from '@/store/types'
++import { FLOATING_TERMINAL_WORKTREE_ID } from '../../../shared/constants'
++import { brandEphemeralSetupTerminalWorktreeId } from '../../../shared/ephemeral-setup-terminal-worktree-id'
++import { folderWorkspaceKey } from '../../../shared/workspace-scope'
++import { hasRenderableTerminalWorktreeSurface } from './terminal-worktree-route'
++
++const EPHEMERAL_ID = brandEphemeralSetupTerminalWorktreeId('hardened-inline-setup')
++
++function state(worktreesByRepo: AppState['worktreesByRepo']): AppState {
++  return {
++    repos: [{ id: 'repo-1', executionHostId: 'local', connectionId: null }],
++    worktreesByRepo,
++    detectedWorktreesByRepo: {},
++    runtimeEnvironments: [],
++    runtimeEnvironmentCatalogHydrated: true,
++    removedRuntimeEnvironmentIds: new Set<string>()
++  } as unknown as AppState
++}
++
++describe('hasRenderableTerminalWorktreeSurface', () => {
++  it('accepts a worktree only when the renderer catalog has one unambiguous row', () => {
++    expect(
++      hasRenderableTerminalWorktreeSurface(
++        state({
++          'repo-1': [{ id: 'repo-1::/work', repoId: 'repo-1', hostId: 'local' }]
++        }),
++        'repo-1::/work'
++      )
++    ).toBe(true)
++
++    // Repo-level routing may still accept this id, but Terminal cannot mount a
++    // pane without a concrete worktree row.
++    expect(hasRenderableTerminalWorktreeSurface(state({ 'repo-1': [] }), 'repo-1::/work')).toBe(
++      false
++    )
++  })
++
++  it('fails closed when duplicate catalog rows disagree about the host', () => {
++    expect(
++      hasRenderableTerminalWorktreeSurface(
++        state({
++          'repo-1': [
++            { id: 'repo-1::/work', repoId: 'repo-1', hostId: 'local' },
++            { id: 'repo-1::/work', repoId: 'repo-1', hostId: 'ssh:other' }
++          ]
++        }),
++        'repo-1::/work'
++      )
++    ).toBe(false)
++  })
++
++  it('preserves surfaces hosted outside the worktree catalog', () => {
++    const empty = state({})
++    expect(hasRenderableTerminalWorktreeSurface(empty, FLOATING_TERMINAL_WORKTREE_ID)).toBe(true)
++    expect(hasRenderableTerminalWorktreeSurface(empty, folderWorkspaceKey('folder-1'))).t
