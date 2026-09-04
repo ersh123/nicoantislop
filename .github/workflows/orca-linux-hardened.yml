@@ -1,0 +1,125 @@
+name: Orca Linux Hardened
+
+on:
+  push:
+    branches: ['**']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: orca-linux-hardened-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  linux:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    env:
+      ORCA_UPSTREAM_SHA: 67e22345daf882190911355eed152ef33e051c5e
+      CI: '1'
+    steps:
+      - name: Checkout hardening harness
+        uses: actions/checkout@v4
+
+      - name: Prepare pinned upstream source
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p work/orca
+          curl --fail --location --retry 5 \
+            "https://codeload.github.com/stablyai/orca/tar.gz/${ORCA_UPSTREAM_SHA}" \
+            | tar -xz --strip-components=1 -C work/orca
+          if [[ -s patches/orca-linux-hardened.patch ]]; then
+            git -C work/orca init -q
+            git -C work/orca add -A
+            git -C work/orca -c user.name=ci -c user.email=ci@example.invalid commit -qm baseline
+            git -C work/orca apply --check ../../patches/orca-linux-hardened.patch
+            git -C work/orca apply --whitespace=error ../../patches/orca-linux-hardened.patch
+          fi
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 12.0.0
+
+      - name: Install Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22.16.0
+          cache: pnpm
+          cache-dependency-path: work/orca/pnpm-lock.yaml
+
+      - name: Install Linux build dependencies
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential python3 pkg-config libsecret-1-dev libx11-dev libxkbfile-dev \
+            libgtk-3-0 libnotify4 libnss3 libxss1 libxtst6 xdg-utils libatspi2.0-0 \
+            libuuid1 libsecret-1-0 xvfb xdotool xclip fakeroot rpm
+
+      - name: Install project dependencies
+        working-directory: work/orca
+        run: pnpm install --frozen-lockfile
+
+      - name: Baseline daemon test
+        if: ${{ hashFiles('patches/orca-linux-hardened.patch') == '' }}
+        working-directory: work/orca
+        run: pnpm test src/main/daemon/terminal-session-teardown.test.ts
+
+      - name: Hardened targeted gates
+        if: ${{ hashFiles('patches/orca-linux-hardened.patch') != '' }}
+        working-directory: work/orca
+        shell: bash
+        run: |
+          set -euo pipefail
+          pnpm test \
+            src/main/daemon/terminal-spawn-admission.test.ts \
+            src/main/daemon/linux-terminal-process-boundary.test.ts \
+            src/main/daemon/terminal-session-owned-tree-teardown.test.ts \
+            src/main/daemon/terminal-session-teardown.test.ts \
+            src/main/runtime/orchestration/worker-terminal-auto-release.test.ts \
+            src/renderer/src/components/native-chat/use-native-chat-composer-attachments-unmount.test.tsx \
+            src/renderer/src/lib/terminal-worktree-renderability.test.ts
+          pnpm exec vitest run --config config/vitest.config.ts \
+            config/scripts/electron-builder-linux-hardened-config.test.mjs
+          pnpm tc:node
+          pnpm tc:web
+          pnpm run check:code-quality:changed || pnpm exec oxlint \
+            src/main/daemon/terminal-spawn-admission.ts \
+            src/main/daemon/linux-terminal-process-boundary.ts \
+            src/main/daemon/terminal-session-teardown.ts \
+            src/main/runtime/orchestration/worker-terminal-auto-release.ts
+
+      - name: Build hardened Debian package
+        if: ${{ hashFiles('patches/orca-linux-hardened.patch') != '' }}
+        working-directory: work/orca
+        env:
+          ORCA_HARDENED_LINUX: '1'
+          ORCA_LOCAL_BUILD_VERSION: 1.4.178-hardened.1
+          ORCA_HARDENED_UPSTREAM_SHA: ${{ env.ORCA_UPSTREAM_SHA }}
+          ORCA_HARDENED_BUILD_RUN: ${{ github.run_id }}
+        run: pnpm run build:linux
+
+      - name: Inspect Debian package
+        if: ${{ hashFiles('patches/orca-linux-hardened.patch') != '' }}
+        shell: bash
+        run: |
+          cp scripts/verify-deb.sh work/orca/verify-deb.sh
+          cd work/orca
+          bash verify-deb.sh
+
+      - name: Upload release evidence
+        if: ${{ always() && hashFiles('patches/orca-linux-hardened.patch') != '' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: orca-hardened-linux-x64-${{ github.sha }}
+          if-no-files-found: error
+          retention-days: 30
+          path: |
+            work/orca/dist/orca-hardened_*.deb
+            work/orca/dist/SHA256SUMS
+            work/orca/dist/package-metadata.txt
