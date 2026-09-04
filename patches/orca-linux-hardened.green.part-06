@@ -1,0 +1,260 @@
++describe('TerminalSpawnAdmission', () => {
++  it('counts pending starts before a process exists and releases idempotently', () => {
++    const admission = policy({ maxConcurrentStarts: 1 })
++    const first = reserve(admission)
++
++    expectAdmissionCode(
++      () => reserve(admission, { sessionId: 'term-2' }),
++      'terminal_spawn_concurrency_limit'
++    )
++
++    first.release()
++    first.release()
++    const second = reserve(admission, { sessionId: 'term-2' })
++    expect(admission.snapshot()).toMatchObject({ pendingStarts: 1, pendingExplicitAgents: 0 })
++    second.release()
++    expect(admission.snapshot()).toMatchObject({ pendingStarts: 0, pendingExplicitAgents: 0 })
++  })
++
++  it('refuses a terminal when live plus pending reaches the terminal limit', () => {
++    const admission = policy({ maxLiveTerminals: 2 })
++    const pending = reserve(admission, { liveTerminals: 1 })
++
++    expectAdmissionCode(
++      () => reserve(admission, { sessionId: 'term-2', liveTerminals: 1 }),
++      'terminal_spawn_terminal_limit'
++    )
++    pending.release()
++  })
++
++  it('derives the explicit-agent cap from available memory', () => {
++    const admission = policy({
++      readMemory: () => ({ totalBytes: 16 * GiB, availableBytes: 7 * GiB })
++    })
++    expectAdmissionCode(
++      () => reserve(admission, { explicitAgent: true, liveExplicitAgents: 2 }),
++      'terminal_spawn_agent_memory_limit'
++    )
++  })
++
++  it('uses max of four GiB and twenty percent when reserve is not configured', () => {
++    const admission = new TerminalSpawnAdmission({
++      hardMaxExplicitAgents: 20,
++      estimatedExplicitAgentBytes: GiB,
++      readMemory: () => ({ totalBytes: 40 * GiB, availableBytes: 10 * GiB })
++    })
++    // 20% of 40 GiB is 8 GiB, leaving room for two one-GiB agents.
++    expectAdmissionCode(
++      () => reserve(admission, { explicitAgent: true, liveExplicitAgents: 2 }),
++      'terminal_spawn_agent_memory_limit'
++    )
++  })
++
++  it('uses the conservative fallback cap when memory evidence is unavailable', () => {
++    const admission = policy({ readMemory: () => null, fallbackExplicitAgentLimit: 2 })
++    expectAdmissionCode(
++      () => reserve(admission, { explicitAgent: true, liveExplicitAgents: 2 }),
++      'terminal_spawn_agent_memory_limit'
++    )
++  })
++
++  it('reserves estimated memory for concurrent explicit-agent starts', () => {
++    const admission = policy({
++      maxConcurrentStarts: 4,
++      readMemory: () => ({ totalBytes: 16 * GiB, availableBytes: 7 * GiB })
++    })
++    const first = reserve(admission, { explicitAgent: true })
++    const second = reserve(admission, { explicitAgent: true, sessionId: 'agent-2' })
++
++    expectAdmissionCode(
++      () => reserve(admission, { explicitAgent: true, sessionId: 'agent-3' }),
++      'terminal_spawn_agent_memory_limit'
++    )
++    first.release()
++    second.release()
++  })
++
++  it('accepts documented environment overrides', () => {
++    const admission = createHardenedTerminalSpawnAdmission({
++      ORCA_HARDENED_MAX_CONCURRENT_STARTS: '1',
++      ORCA_HARDENED_MAX_TERMINALS: '1',
++      ORCA_HARDENED_MAX_AGENTS: '1',
++      ORCA_HARDENED_RESERVED_MEMORY_GIB: '0',
++      ORCA_HARDENED_AGENT_ESTIMATE_MIB: '1',
++      ORCA_HARDENED_FALLBACK_AGENTS: '1'
++    })
++    const first = reserve(admission)
++    expectAdmissionCode(
++      () => reserve(admission, { sessionId: 'term-2' }),
++      'terminal_spawn_concurrency_limit'
++    )
++    first.release()
++  })
++})
++
++function mockSubprocess(pid: number): SubprocessHandle {
++  let onExit: ((code: number) => void) | null = null
++  return {
++    pid,
++    getForegroundProcess: () => null,
++    write() {},
++    resize() {},
++    kill() {},
++    forceKill() {
++      onExit?.(137)
++    },
++    terminateOwnedTree: () => 'unavailable',
++    signal() {},
++    onData() {},
++    onExit(cb) {
++      onExit = cb
++    },
++    dispose() {}
++  }
++}
++
++describe('TerminalHost spawn admission integration', () => {
++  it('releases the pending-start reservation after a spawn failure', async () => {
++    const admission = policy({ maxConcurrentStarts: 1 })
++    const spawn = vi
++      .fn()
++      .mockRejectedValueOnce(new Error('spawn failed'))
++      .mockReturnValueOnce(mockSubprocess(2))
++    const host = new TerminalHost({ spawnSubprocess: spawn, spawnAdmission: admission })
++    const create = (sessionId: string) =>
++      host.createOrAttach({
++        sessionId,
++        cols: 80,
++        rows: 24,
++        streamClient: { onData() {}, onExit() {} }
++      })
++
++    await expect(create('failed')).rejects.toThrow('spawn failed')
++    await expect(create('next')).resolves.toMatchObject({ isNew: true, pid: 2 })
++    expect(admission.snapshot().pendingStarts).toBe(0)
++  })
++
++  it('does not reserve another start when attaching to an existing session', async () => {
++    const admission = policy({ maxConcurrentStarts: 1 })
++    const host = new TerminalHost({
++      spawnSubprocess: () => mockSubprocess(3),
++      spawnAdmission: admission
++    })
++    const input = {
++      sessionId: 'same',
++      cols: 80,
++      rows: 24,
++      streamClient: { onData() {}, onExit() {} }
++    }
++
++    await host.createOrAttach(input)
++    await host.createOrAttach(input)
++
++    expect(admission.snapshot()).toMatchObject({ pendingStarts: 0, pendingExplicitAgents: 0 })
++  })
++})
+diff --git a/src/main/daemon/terminal-spawn-admission.ts b/src/main/daemon/terminal-spawn-admission.ts
+new file mode 100644
+index 00000000..aea20b18
+--- /dev/null
++++ b/src/main/daemon/terminal-spawn-admission.ts
+@@ -0,0 +1,207 @@
++import { readFileSync } from 'node:fs'
++
++const MiB = 1024 ** 2
++const GiB = 1024 ** 3
++const DEFAULT_RESERVED_MEMORY_FRACTION = 0.2
++
++export type TerminalSpawnMemorySnapshot = {
++  totalBytes: number
++  availableBytes: number
++}
++
++export type TerminalSpawnAdmissionCode =
++  | 'terminal_spawn_concurrency_limit'
++  | 'terminal_spawn_terminal_limit'
++  | 'terminal_spawn_agent_memory_limit'
++
++export class TerminalSpawnAdmissionError extends Error {
++  constructor(
++    readonly code: TerminalSpawnAdmissionCode,
++    message: string
++  ) {
++    super(message)
++    this.name = 'TerminalSpawnAdmissionError'
++  }
++}
++
++export type TerminalSpawnAdmissionOptions = {
++  maxConcurrentStarts?: number
++  maxLiveTerminals?: number
++  hardMaxExplicitAgents?: number
++  reservedHostMemoryBytes?: number
++  estimatedExplicitAgentBytes?: number
++  fallbackExplicitAgentLimit?: number
++  readMemory?: () => TerminalSpawnMemorySnapshot | null
++}
++
++export type TerminalSpawnReservation = {
++  release(): void
++}
++
++export type TerminalSpawnAdmissionSnapshot = {
++  pendingStarts: number
++  pendingExplicitAgents: number
++}
++
++export class TerminalSpawnAdmission {
++  private readonly maxConcurrentStarts: number
++  private readonly maxLiveTerminals: number
++  private readonly hardMaxExplicitAgents: number
++  private readonly reservedHostMemoryBytes: number | null
++  private readonly estimatedExplicitAgentBytes: number
++  private readonly fallbackExplicitAgentLimit: number
++  private readonly readMemory: () => TerminalSpawnMemorySnapshot | null
++  private pendingStarts = 0
++  private pendingExplicitAgents = 0
++
++  constructor(options: TerminalSpawnAdmissionOptions = {}) {
++    this.maxConcurrentStarts = positiveInteger(options.maxConcurrentStarts, 2)
++    this.maxLiveTerminals = positiveInteger(options.maxLiveTerminals, 24)
++    this.hardMaxExplicitAgents = positiveInteger(options.hardMaxExplicitAgents, 6)
++    this.reservedHostMemoryBytes = optionalNonNegativeNumber(options.reservedHostMemoryBytes)
++    this.estimatedExplicitAgentBytes = positiveNumber(
++      options.estimatedExplicitAgentBytes,
++      1536 * MiB
++    )
++    this.fallbackExplicitAgentLimit = positiveInteger(options.fallbackExplicitAgentLimit, 2)
++    this.readMemory = options.readMemory ?? readLinuxMemorySnapshot
++  }
++
++  reserve(input: {
++    sessionId: string
++    explicitAgent: boolean
++    liveTerminals: number
++    liveExplicitAgents: number
++  }): TerminalSpawnReservation {
++    if (this.pendingStarts >= this.maxConcurrentStarts) {
++      throw new TerminalSpawnAdmissionError(
++        'terminal_spawn_concurrency_limit',
++        `Terminal ${input.sessionId} was not started: ${this.pendingStarts} start(s) are already in progress`
++      )
++    }
++    if (input.liveTerminals + this.pendingStarts >= this.maxLiveTerminals) {
++      throw new TerminalSpawnAdmissionError(
++        'terminal_spawn_terminal_limit',
++        `Terminal ${input.sessionId} was not started: the ${this.maxLiveTerminals}-terminal limit is reached`
++      )
++    }
++    if (input.explicitAgent) {
++      const limit = this.resolveExplicitAgentLimit()
++      if (input.liveExplicitAgents + this.pendingExplicitAgents >= limit) {
++        throw new TerminalSpawnAdmissionError(
++          'terminal_spawn_agent_memory_limit',
++          `Agent ${input.sessionId} was not started: current memory permits ${limit} concurrent explicit agent(s)`
++        )
++      }
++    }
++
++    this.pendingStarts += 1
++    if (input.explicitAgent) {
