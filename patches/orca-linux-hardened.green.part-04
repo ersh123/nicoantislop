@@ -1,0 +1,260 @@
+   maxTombstones?: number
+ }
+diff --git a/src/main/daemon/terminal-host-session-create.ts b/src/main/daemon/terminal-host-session-create.ts
+index 8f6833c3..3caca34f 100644
+--- a/src/main/daemon/terminal-host-session-create.ts
++++ b/src/main/daemon/terminal-host-session-create.ts
+@@ -10,6 +10,7 @@ import type { CreateOrAttachResult } from './terminal-host-create-contract'
+ import type { TerminalHostOptions } from './terminal-host-options'
+ import type { TerminalHostTombstones } from './terminal-host-tombstones'
+ import type { TerminalSessionTeardown } from './terminal-session-teardown'
++import type { TerminalSpawnAdmission } from './terminal-spawn-admission'
+ import { resolveDaemonSessionScrollbackRows } from './daemon-session-scrollback-window'
+ import { TerminalAttachCanceledError } from './daemon-errors'
+ import { rejectOnAbort } from './terminal-attach-cancellation'
+@@ -23,6 +24,7 @@ type TerminalHostSessionCreateDependencies = {
+   sessionTeardown: TerminalSessionTeardown
+   killedTombstones: TerminalHostTombstones
+   spawnSubprocess: TerminalHostOptions['spawnSubprocess']
++  spawnAdmission?: TerminalSpawnAdmission
+   onDeadSessionRemoved: (sessionId: string) => void
+   onSessionCreated: (sessionId: string, generation: string | undefined, isAlive: boolean) => void
+   onSessionExit: (sessionId: string, generation: string | undefined) => void
+@@ -107,6 +109,24 @@ async function spawnAndPublishSession(
+   opts: InternalCreateOrAttachOptions,
+   deps: TerminalHostSessionCreateDependencies,
+   ctx: { size: { cols: number; rows: number }; wslDistro: string | undefined }
++): Promise<CreateOrAttachResult> {
++  const reservation = deps.spawnAdmission?.reserve({
++    sessionId: opts.sessionId,
++    explicitAgent: opts.launchAgent !== undefined,
++    liveTerminals: countLiveSessions(deps.sessions),
++    liveExplicitAgents: countLiveExplicitAgentSessions(deps.sessions)
++  })
++  try {
++    return await spawnAndPublishReservedSession(opts, deps, ctx)
++  } finally {
++    reservation?.release()
++  }
++}
++
++async function spawnAndPublishReservedSession(
++  opts: InternalCreateOrAttachOptions,
++  deps: TerminalHostSessionCreateDependencies,
++  ctx: { size: { cols: number; rows: number }; wslDistro: string | undefined }
+ ): Promise<CreateOrAttachResult> {
+   const { size, wslDistro } = ctx
+   // Why before the fork: the shell's own cwd may already have fallen back, so probe the requested path.
+@@ -224,3 +244,24 @@ function isCwdReadableByThisProcess(cwd: string): boolean {
+     return code !== 'EACCES' && code !== 'EPERM'
+   }
+ }
++
++
++function countLiveSessions(sessions: ReadonlyMap<string, Session>): number {
++  let count = 0
++  for (const session of sessions.values()) {
++    if (session.isAlive) {
++      count += 1
++    }
++  }
++  return count
++}
++
++function countLiveExplicitAgentSessions(sessions: ReadonlyMap<string, Session>): number {
++  let count = 0
++  for (const session of sessions.values()) {
++    if (session.isAlive && session.launchAgent) {
++      count += 1
++    }
++  }
++  return count
++}
+diff --git a/src/main/daemon/terminal-host.ts b/src/main/daemon/terminal-host.ts
+index 18f7b82a..c58c9a57 100644
+--- a/src/main/daemon/terminal-host.ts
++++ b/src/main/daemon/terminal-host.ts
+@@ -51,6 +51,7 @@ export class TerminalHost {
+   private sessionTeardown = new TerminalSessionTeardown(this.sessions)
+   private killedTombstones: TerminalHostTombstones
+   private spawnSubprocess: TerminalHostOptions['spawnSubprocess']
++  private spawnAdmission: TerminalHostOptions['spawnAdmission']
+   private onSessionReaped: TerminalHostOptions['onSessionReaped']
+   private reportReadinessEvent: TerminalHostOptions['reportReadinessEvent']
+   private onFinalCheckpoint: TerminalHostOptions['onFinalCheckpoint']
+@@ -68,6 +69,7 @@ export class TerminalHost {
+ 
+   constructor(opts: TerminalHostOptions) {
+     this.spawnSubprocess = opts.spawnSubprocess
++    this.spawnAdmission = opts.spawnAdmission
+     this.onSessionReaped = opts.onSessionReaped
+     this.reportReadinessEvent = opts.reportReadinessEvent
+     this.onFinalCheckpoint = opts.onFinalCheckpoint
+@@ -117,6 +119,7 @@ export class TerminalHost {
+             sessionTeardown: this.sessionTeardown,
+             killedTombstones: this.killedTombstones,
+             spawnSubprocess: this.spawnSubprocess,
++            spawnAdmission: this.spawnAdmission,
+             onDeadSessionRemoved: (sessionId) => this.agentSessionGenerations.forget(sessionId),
+             onSessionCreated: (sessionId, generation, isAlive) =>
+               this.agentSessionGenerations.remember(sessionId, generation, isAlive),
+diff --git a/src/main/daemon/terminal-session-owned-tree-teardown.test.ts b/src/main/daemon/terminal-session-owned-tree-teardown.test.ts
+new file mode 100644
+index 00000000..024d2f5f
+--- /dev/null
++++ b/src/main/daemon/terminal-session-owned-tree-teardown.test.ts
+@@ -0,0 +1,101 @@
++import { beforeEach, describe, expect, it, vi } from 'vitest'
++import { TerminalSessionTeardown } from './terminal-session-teardown'
++import type { Session } from './session'
++
++const killWithDescendantSweepMock = vi.hoisted(() => vi.fn())
++vi.mock('../pty-descendant-termination', () => ({
++  killWithDescendantSweep: killWithDescendantSweepMock
++}))
++
++type MutableSession = Session & { isAlive: boolean; isTerminating: boolean }
++
++function session(overrides: Partial<Session> = {}): MutableSession {
++  return {
++    launchAgent: null,
++    pid: 4321,
++    isAlive: true,
++    isTerminating: false,
++    beginTermination: vi.fn(function (this: MutableSession) {
++      if (this.isTerminating) return false
++      this.isTerminating = true
++      return true
++    }),
++    terminateOwnedBoundary: vi.fn(async () => 'terminated' as const),
++    terminateOwnedTree: vi.fn(() => 'unavailable' as const),
++    scheduleForceDisposeFallback: vi.fn(),
++    signalTerminationRoot: vi.fn(),
++    forceKillAndWaitForExit: vi.fn(async () => {}),
++    ...overrides
++  } as unknown as MutableSession
++}
++
++describe('TerminalSessionTeardown owned-tree policy', () => {
++  beforeEach(() => {
++    killWithDescendantSweepMock.mockReset()
++    killWithDescendantSweepMock.mockImplementation(
++      async (_pid: number, signalRoot: () => void) => signalRoot()
++    )
++  })
++
++  it('captures descendants for a hand-typed agent whose launchAgent is null', async () => {
++    const target = session({ launchAgent: null })
++    const teardown = new TerminalSessionTeardown(new Map([['s1', target]]))
++
++    await teardown.killSession('s1', target, false)
++
++    expect(killWithDescendantSweepMock).toHaveBeenCalledWith(
++      target.pid,
++      expect.any(Function),
++      expect.objectContaining({
++        ownsRoot: expect.any(Function),
++        terminateOwnedTree: expect.any(Function)
++      })
++    )
++    expect(target.terminateOwnedBoundary).toHaveBeenCalledWith('SIGTERM')
++    expect(target.signalTerminationRoot).toHaveBeenCalledOnce()
++    expect(target.scheduleForceDisposeFallback).toHaveBeenCalledOnce()
++  })
++
++  it('captures descendants for an ordinary plain shell too', async () => {
++    const target = session({ launchAgent: null })
++    const teardown = new TerminalSessionTeardown(new Map([['s1', target]]))
++
++    await teardown.killSession('s1', target, true)
++
++    expect(killWithDescendantSweepMock).toHaveBeenCalledOnce()
++    expect(target.terminateOwnedBoundary).toHaveBeenCalledWith('SIGKILL')
++    expect(target.forceKillAndWaitForExit).toHaveBeenCalledOnce()
++  })
++
++  it('joins repeated close requests and escalates the shared operation', async () => {
++    let releaseSweep: (() => void) | null = null
++    killWithDescendantSweepMock.mockImplementation(
++      () => new Promise<void>((resolve) => (releaseSweep = resolve))
++    )
++    const target = session()
++    const teardown = new TerminalSessionTeardown(new Map([['s1', target]]))
++
++    const graceful = teardown.killSession('s1', target, false) as Promise<void>
++    const immediate = teardown.requestImmediate('s1')
++
++    expect(immediate).toBe(graceful)
++    expect(killWithDescendantSweepMock).toHaveBeenCalledOnce()
++    releaseSweep?.()
++    await graceful
++  })
++
++  it('does not signal a recycled pid after the session loses ownership', async () => {
++    const target = session()
++    const sessions = new Map<string, Session>([['s1', target]])
++    const teardown = new TerminalSessionTeardown(sessions)
++
++    await teardown.killSession('s1', target, false)
++    const options = killWithDescendantSweepMock.mock.calls[0]?.[2] as {
++      ownsRoot: () => boolean
++    }
++    expect(options.ownsRoot()).toBe(true)
++
++    sessions.delete('s1')
++    expect(options.ownsRoot()).toBe(false)
++  })
++})
+diff --git a/src/main/daemon/terminal-session-teardown.test.ts b/src/main/daemon/terminal-session-teardown.test.ts
+index 95010efd..75aa8e92 100644
+--- a/src/main/daemon/terminal-session-teardown.test.ts
++++ b/src/main/daemon/terminal-session-teardown.test.ts
+@@ -16,6 +16,7 @@ function createPlainShellSession(overrides: Partial<Session> = {}): Session {
+     beginTermination: vi.fn(() => true),
+     kill: vi.fn(),
+     terminateOwnedTree: vi.fn(() => 'terminated' as const),
++    terminateOwnedBoundary: vi.fn(async () => 'terminated' as const),
+     scheduleForceDisposeFallback: vi.fn(),
+     signalTerminationRoot: vi.fn(),
+     ...overrides
+@@ -97,27 +98,28 @@ describe('TerminalSessionTeardown plain-shell teardown', () => {
+     expect(ownsRoot()).toBe(false)
+   })
+ 
+-  it('non-win32 immediate kill skips the tree kill (pgroup force-kill suffices)', async () => {
++  it('non-win32 immediate kill sweeps detached descendants before force-kill', async () => {
+     setPlatform('linux')
+     const session = createPlainShellSession()
+     const teardown = new TerminalSessionTeardown(new Map([['s1', session]]))
+ 
+     await teardown.killSession('s1', session, true)
+ 
+-    expect(killWithDescendantSweepMock).not.toHaveBeenCalled()
++    expect(killWithDescendantSweepMock).toHaveBeenCalledOnce()
+     expect(session.forceKillAndWaitForExit).toHaveBeenCalled()
++    expect(session.terminateOwnedBoundary).toHaveBeenCalledWith('SIGKILL')
+   })
+ 
+-  it('non-immediate (graceful) kill uses the plain kill path without a sweep', async () => {
++  it('non-immediate plain-shell kill sweeps descendants before signalling the root', async () => {
+     setPlatform('win32')
+     const session = createPlainShellSession()
+     const teardown = new TerminalSessionTeardown(new Map([['s1', session]]))
+ 
+     await teardown.killSession('s1', session, false)
+ 
+-    expect(killWithDescendantSweepMock).not.toHaveBeenCalled()
++    expect(killWithDescendantSweepMock).toHaveBeenCalledOnce()
+     expect(session.forceKillAndWaitForExit).not.toHaveBeenCalled()
+-    expect(session.kill).toHaveBeenCalled()
++    expect(session.terminateOwnedBoundary).toHaveBeenCalledWith('SIGTERM')
+   })
+ })
+ 
+diff --git a/src/main/daemon/terminal-session-teardown.ts b/src/main/daemon/terminal-session-teardown.ts
+index 017f841a..0875d17f 100644
+--- a/src/main/daemon/terminal-session-teardown.ts
++++ b/src/main/daemon/terminal-session-teardown.ts
+@@ -6,6 +6,7 @@ type TeardownOperation = {
+   immediate: boolean
+   rootSignalled: boolean
