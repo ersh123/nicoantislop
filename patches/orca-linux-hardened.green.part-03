@@ -1,0 +1,260 @@
++    ]
++  }
++}
++
++export async function createLinuxTerminalProcessBoundary(input: {
++  enabled: boolean
++  sessionId: string
++  shellPath: string
++  shellArgs: readonly string[]
++  nonce?: string
++  runProcess?: RunProcess
++  env?: NodeJS.ProcessEnv
++}): Promise<LinuxTerminalProcessBoundary | null> {
++  if (!input.enabled) {
++    return null
++  }
++  const runProcess = input.runProcess ?? defaultRunProcess
++  if (!(await systemdUserManagerAvailable(runProcess))) {
++    return null
++  }
++  const launch = buildLinuxTerminalScopeLaunch({
++    sessionId: input.sessionId,
++    nonce: input.nonce ?? randomUUID(),
++    shellPath: input.shellPath,
++    shellArgs: input.shellArgs,
++    env: input.env
++  })
++  const completedSignals = new Set<LinuxTerminalBoundarySignal>()
++  return {
++    ...launch,
++    async terminate(signal) {
++      if (completedSignals.has(signal)) {
++        return 'terminated'
++      }
++      const result = await runProcess({
++        program: 'systemctl',
++        args: ['--user', 'kill', '--kill-whom=all', `--signal=${signal}`, launch.unitName],
++        timeoutMs: 5_000,
++        maxOutputBytes: 256 * 1024
++      }).catch(() => null)
++      if (!result || result.timedOut || result.code !== 0) {
++        return 'unverifiable'
++      }
++      completedSignals.add(signal)
++      return 'terminated'
++    }
++  }
++}
++
++export function resetLinuxTerminalBoundarySupportForTests(): void {
++  supportProbe = null
++}
++
++function systemdUserManagerAvailable(runProcess: RunProcess): Promise<boolean> {
++  supportProbe ??= runProcess({
++    program: 'systemctl',
++    args: ['--user', 'show-environment'],
++    timeoutMs: 3_000,
++    maxOutputBytes: 64 * 1024
++  })
++    .then(async (result) => {
++      if (result.timedOut || result.code !== 0) {
++        return false
++      }
++      // The Debian post-install drops the slice into /usr/lib/systemd/user.
++      // Reload here so an already-running user manager sees it without logout.
++      await runProcess({
++        program: 'systemctl',
++        args: ['--user', 'daemon-reload'],
++        timeoutMs: 3_000,
++        maxOutputBytes: 64 * 1024
++      }).catch(() => null)
++      return true
++    })
++    .catch(() => false)
++  return supportProbe
++}
++
++function normalizeUnitToken(value: string): string {
++  const normalized = value.toLowerCase().replace(/[^a-z0-9]/g, '').slice(0, 24)
++  return normalized || 'session'
++}
++
++function normalizedSystemdSize(raw: string | undefined, fallback: string): string {
++  return raw && /^\d+(?:\.\d+)?[KMGTP]$/i.test(raw.trim()) ? raw.trim().toUpperCase() : fallback
++}
++
++function normalizedPositiveInteger(raw: string | undefined, fallback: number): number {
++  const value = raw?.trim() ? Number(raw) : Number.NaN
++  return Number.isFinite(value) && value > 0 ? Math.floor(value) : fallback
++}
+diff --git a/src/main/daemon/pty-subprocess.ts b/src/main/daemon/pty-subprocess.ts
+index 8e8d2314..ab7f495d 100644
+--- a/src/main/daemon/pty-subprocess.ts
++++ b/src/main/daemon/pty-subprocess.ts
+@@ -13,6 +13,10 @@ import {
+ import { createDaemonPtySubprocessHandle } from './pty-subprocess/subprocess-handle'
+ import type { StartupCommandDelivery } from '../../shared/codex-startup-delivery'
+ import type { TuiAgent } from '../../shared/tui-agent'
++import {
++  createLinuxTerminalProcessBoundary,
++  isHardenedLinuxRuntime
++} from './linux-terminal-process-boundary'
+ 
+ const PTY_SPAWN_HEALTH_RETRY_ATTEMPTS = 2
+ 
+@@ -80,11 +84,20 @@ export async function createPtySubprocess(opts: PtySubprocessOptions): Promise<S
+     throw new TerminalAttachCanceledError(opts.sessionId)
+   }
+ 
++  const processBoundary = await createLinuxTerminalProcessBoundary({
++    enabled: isHardenedLinuxRuntime(),
++    sessionId: opts.sessionId,
++    shellPath: launch.shellPath,
++    shellArgs: launch.shellArgs
++  })
++  const spawnShellPath = processBoundary?.shellPath ?? launch.shellPath
++  const spawnShellArgs = processBoundary?.shellArgs ?? launch.shellArgs
++
+   let spawned: SpawnedDaemonPty
+   try {
+     spawned = spawnNativeDaemonPty({
+-      shellPath: launch.shellPath,
+-      shellArgs: launch.shellArgs,
++      shellPath: spawnShellPath,
++      shellArgs: spawnShellArgs,
+       spawnCwd: launch.spawnCwd,
+       env,
+       cols: size.cols,
+@@ -94,14 +107,14 @@ export async function createPtySubprocess(opts: PtySubprocessOptions): Promise<S
+     })
+   } catch (error) {
+     if (process.platform === 'win32') {
+-      throw formatPtySpawnError(error, launch.shellPath, launch.spawnCwd)
++      throw formatPtySpawnError(error, spawnShellPath, launch.spawnCwd)
+     }
+     throw error
+   }
+ 
+   return createDaemonPtySubprocessHandle({
+     process: spawned.process,
+-    shellPath: spawned.shellPath,
++    shellPath: processBoundary ? launch.shellPath : spawned.shellPath,
+     spawnCwd: spawned.spawnCwd,
+     env,
+     startupCommandDeliveredInShellArgs:
+@@ -109,6 +122,7 @@ export async function createPtySubprocess(opts: PtySubprocessOptions): Promise<S
+     reportsChildExitStatus: spawned.reportsChildExitStatus,
+     requestedCwd: opts.cwd,
+     sessionId: opts.sessionId,
+-    startupAgentRecognition: launch.startupAgentRecognition
++    startupAgentRecognition: launch.startupAgentRecognition,
++    ...(processBoundary ? { processBoundary } : {})
+   })
+ }
+diff --git a/src/main/daemon/pty-subprocess/subprocess-handle.ts b/src/main/daemon/pty-subprocess/subprocess-handle.ts
+index e2abd59c..eee2c161 100644
+--- a/src/main/daemon/pty-subprocess/subprocess-handle.ts
++++ b/src/main/daemon/pty-subprocess/subprocess-handle.ts
+@@ -9,6 +9,7 @@ import { isValidPtySize } from '../daemon-pty-size'
+ import type { SubprocessHandle } from '../session-subprocess-handle'
+ import { createPtyForegroundProcessTracker } from './foreground-process-tracker'
+ import { PtyPreListenerEvents } from './pre-listener-events'
++import type { LinuxTerminalProcessBoundary } from '../linux-terminal-process-boundary'
+ 
+ type DisposableNativePty = pty.IPty & { destroy?: () => void }
+ 
+@@ -22,6 +23,7 @@ export function createDaemonPtySubprocessHandle(args: {
+   requestedCwd?: string
+   sessionId: string
+   startupAgentRecognition: RecognizedAgentProcess | null
++  processBoundary?: LinuxTerminalProcessBoundary
+ }): SubprocessHandle {
+   const proc = args.process
+   // node-pty exposes destroy at runtime but omits it from IPty.
+@@ -137,6 +139,9 @@ export function createDaemonPtySubprocessHandle(args: {
+       }
+     },
+     terminateOwnedTree: () => terminatePtyJob(proc),
++    ...(args.processBoundary
++      ? { terminateOwnedBoundary: (signal) => args.processBoundary!.terminate(signal) }
++      : {}),
+     forceKill: () => {
+       if (dead) {
+         return
+diff --git a/src/main/daemon/session-subprocess-handle.ts b/src/main/daemon/session-subprocess-handle.ts
+index f14469af..38b96548 100644
+--- a/src/main/daemon/session-subprocess-handle.ts
++++ b/src/main/daemon/session-subprocess-handle.ts
+@@ -1,6 +1,10 @@
+ import type { TerminalExitCause } from '../../shared/terminal-exit-cause'
+ 
+ import type { JobTerminationOutcome } from '../windows/windows-pty-job'
++import type {
++  LinuxTerminalBoundarySignal,
++  LinuxTerminalBoundaryTermination
++} from './linux-terminal-process-boundary'
+ 
+ export type SubprocessHandle = {
+   pid: number
+@@ -38,6 +42,10 @@ export type SubprocessHandle = {
+    * `terminated`, so callers must fall back rather than assume the tree is gone.
+    */
+   terminateOwnedTree(): JobTerminationOutcome
++  /** Terminates the Linux systemd scope when one owns this PTY. */
++  terminateOwnedBoundary?(
++    signal: LinuxTerminalBoundarySignal
++  ): Promise<LinuxTerminalBoundaryTermination>
+   signal(sig: string): void
+   onData(cb: (data: string) => void): void
+   onExit(cb: (code: number, cause?: TerminalExitCause) => void): void
+diff --git a/src/main/daemon/session.ts b/src/main/daemon/session.ts
+index b0f1dfa5..a30a7a86 100644
+--- a/src/main/daemon/session.ts
++++ b/src/main/daemon/session.ts
+@@ -22,6 +22,10 @@ import type {
+   TerminalSnapshot
+ } from './types'
+ import type { TerminalExitCause } from '../../shared/terminal-exit-cause'
++import type {
++  LinuxTerminalBoundarySignal,
++  LinuxTerminalBoundaryTermination
++} from './linux-terminal-process-boundary'
+ 
+ export class Session {
+   readonly sessionId: string
+@@ -139,6 +143,14 @@ export class Session {
+     return this.subprocess.terminateOwnedTree()
+   }
+ 
++
++  /** Terminate this session's Linux systemd scope when available. */
++  terminateOwnedBoundary(
++    signal: LinuxTerminalBoundarySignal
++  ): Promise<LinuxTerminalBoundaryTermination> {
++    return this.subprocess.terminateOwnedBoundary?.(signal) ?? Promise.resolve('unverifiable')
++  }
++
+   write(data: string): void {
+     if (this._state === 'exited' || this._disposed) {
+       return
+diff --git a/src/main/daemon/terminal-host-options.ts b/src/main/daemon/terminal-host-options.ts
+index 9bb5ff48..6faef0a0 100644
+--- a/src/main/daemon/terminal-host-options.ts
++++ b/src/main/daemon/terminal-host-options.ts
+@@ -2,6 +2,7 @@ import type { StartupCommandDelivery } from '../../shared/codex-startup-delivery
+ import type { TuiAgent } from '../../shared/tui-agent'
+ import type { SubprocessHandle } from './session-subprocess-handle'
+ import type { TakePendingOutputResult, TerminalSnapshot } from './types'
++import type { TerminalSpawnAdmission } from './terminal-spawn-admission'
+ 
+ export type TerminalHostOptions = {
+   spawnSubprocess: (opts: {
+@@ -33,6 +34,8 @@ export type TerminalHostOptions = {
+     snapshot: TerminalSnapshot,
+     records: TakePendingOutputResult['records']
+   ) => void
++  /** Reserves process and memory capacity before an asynchronous fork starts. */
++  spawnAdmission?: TerminalSpawnAdmission
+   // Why: tests need deterministic tombstone eviction without thousands of sessions.
