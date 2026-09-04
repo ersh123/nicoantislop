@@ -1,0 +1,45 @@
++    runtimeEnvironments: [],
++    runtimeEnvironmentCatalogHydrated: true,
++    removedRuntimeEnvironmentIds: new Set<string>()
++  } as unknown as AppState
++}
++
++describe('hasRenderableTerminalWorktreeSurface', () => {
++  it('accepts a worktree only when the renderer catalog has one unambiguous row', () => {
++    expect(
++      hasRenderableTerminalWorktreeSurface(
++        state({
++          'repo-1': [{ id: 'repo-1::/work', repoId: 'repo-1', hostId: 'local' }]
++        }),
++        'repo-1::/work'
++      )
++    ).toBe(true)
++
++    // Repo-level routing may still accept this id, but Terminal cannot mount a
++    // pane without a concrete worktree row.
++    expect(hasRenderableTerminalWorktreeSurface(state({ 'repo-1': [] }), 'repo-1::/work')).toBe(
++      false
++    )
++  })
++
++  it('fails closed when duplicate catalog rows disagree about the host', () => {
++    expect(
++      hasRenderableTerminalWorktreeSurface(
++        state({
++          'repo-1': [
++            { id: 'repo-1::/work', repoId: 'repo-1', hostId: 'local' },
++            { id: 'repo-1::/work', repoId: 'repo-1', hostId: 'ssh:other' }
++          ]
++        }),
++        'repo-1::/work'
++      )
++    ).toBe(false)
++  })
++
++  it('preserves surfaces hosted outside the worktree catalog', () => {
++    const empty = state({})
++    expect(hasRenderableTerminalWorktreeSurface(empty, FLOATING_TERMINAL_WORKTREE_ID)).toBe(true)
++    expect(hasRenderableTerminalWorktreeSurface(empty, folderWorkspaceKey('folder-1'))).toBe(true)
++    expect(hasRenderableTerminalWorktreeSurface(empty, EPHEMERAL_ID)).toBe(true)
++  })
++})
