@@ -1,0 +1,249 @@
+   isQuittingForUpdate(): boolean {
+@@ -129,6 +138,9 @@ export class UpdaterSetup extends UpdaterDownloadInstall {
+       this.sendErrorStatus(`The server update did not complete: ${serveHandoffFailure}`, true)
+     }
+ 
++    if (isHardenedLinuxRuntime()) {
++      return
++    }
+     if (!app.isPackaged && !is.dev) {
+       return
+     }
+diff --git a/src/renderer/src/components/native-chat/use-native-chat-composer-attachments-unmount.test.tsx b/src/renderer/src/components/native-chat/use-native-chat-composer-attachments-unmount.test.tsx
+new file mode 100644
+index 00000000..e8e2c55d
+--- /dev/null
++++ b/src/renderer/src/components/native-chat/use-native-chat-composer-attachments-unmount.test.tsx
+@@ -0,0 +1,70 @@
++// @vitest-environment happy-dom
++import { act, renderHook } from '@testing-library/react'
++import { afterEach, describe, expect, it, vi } from 'vitest'
++import { createRef } from 'react'
++import {
++  clearNativeChatAttachmentCacheForTests,
++  useNativeChatComposerAttachments
++} from './use-native-chat-composer-attachments'
++
++vi.mock('@/i18n/i18n', () => ({
++  translate: (_key: string, fallback: string) => fallback
++}))
++vi.mock('@/runtime/runtime-terminal-inspection', () => ({
++  isRemoteRuntimePtyId: () => false
++}))
++
++function renderAttachments() {
++  return renderHook(() =>
++    useNativeChatComposerAttachments({
++      attachmentScopeKey: 'pane-1',
++      caret: 0,
++      disabled: false,
++      isComposing: () => false,
++      resolveTarget: () => ({
++        ptyId: 'pty-1',
++        settings: { activeRuntimeEnvironmentId: null }
++      }),
++      textareaRef: createRef<HTMLTextAreaElement>(),
++      setCaret: () => {},
++      setDraft: () => {},
++      setNotice: () => {}
++    })
++  )
++}
++
++describe('native chat attachment preview lifetime', () => {
++  afterEach(() => {
++    clearNativeChatAttachmentCacheForTests()
++    vi.restoreAllMocks()
++  })
++
++  it('revokes a pending blob preview when the composer unmounts', () => {
++    const revoke = vi.spyOn(URL, 'revokeObjectURL').mockImplementation(() => undefined)
++    const view = renderAttachments()
++
++    act(() => {
++      view.result.current.beginPendingImageAttachment('blob:clipboard-preview')
++    })
++    view.unmount()
++
++    expect(revoke).toHaveBeenCalledTimes(1)
++    expect(revoke).toHaveBeenCalledWith('blob:clipboard-preview')
++  })
++
++  it('does not double-revoke a preview removed before unmount', () => {
++    const revoke = vi.spyOn(URL, 'revokeObjectURL').mockImplementation(() => undefined)
++    const view = renderAttachments()
++    let id: string | null = null
++
++    act(() => {
++      id = view.result.current.beginPendingImageAttachment('blob:clipboard-preview')
++    })
++    act(() => {
++      view.result.current.dropPendingImageAttachment(id as string)
++    })
++    view.unmount()
++
++    expect(revoke).toHaveBeenCalledTimes(1)
++  })
++})
+diff --git a/src/renderer/src/components/native-chat/use-native-chat-composer-attachments.ts b/src/renderer/src/components/native-chat/use-native-chat-composer-attachments.ts
+index c7a8c7ab..470eb02b 100644
+--- a/src/renderer/src/components/native-chat/use-native-chat-composer-attachments.ts
++++ b/src/renderer/src/components/native-chat/use-native-chat-composer-attachments.ts
+@@ -47,11 +47,22 @@ export function useNativeChatComposerAttachments({
+   const [imageAttachments, setImageAttachments] = useState<NativeChatComposerImageAttachment[]>(
+     () => readNativeChatAttachmentCache(attachmentScopeKey)
+   )
++  const liveImageAttachmentsRef = useRef(imageAttachments)
+   const imageAttachmentCounter = useRef(0)
+   const pendingResolvedPathsRef = useRef<{ path: string; connectionId?: string | null }[]>([])
+   const pendingPathLimitRejectedRef = useRef(false)
+   const disabledRef = useRef(disabled)
+ 
++  useLayoutEffect(
++    () => () => {
++      for (const attachment of liveImageAttachmentsRef.current) {
++        releaseAttachmentPreview(attachment)
++      }
++      liveImageAttachmentsRef.current = []
++    },
++    []
++  )
++
+   useLayoutEffect(() => {
+     disabledRef.current = disabled
+     if (disabled) {
+@@ -68,6 +79,7 @@ export function useNativeChatComposerAttachments({
+     ) => {
+       setImageAttachments((prev) => {
+         const next = updater(prev)
++        liveImageAttachmentsRef.current = next
+         writeNativeChatAttachmentCache(attachmentScopeKey, next)
+         return next
+       })
+diff --git a/src/renderer/src/hooks/ipc-events/terminal-request-ipc-bridge.ts b/src/renderer/src/hooks/ipc-events/terminal-request-ipc-bridge.ts
+index 1fd3eed2..3fb02800 100644
+--- a/src/renderer/src/hooks/ipc-events/terminal-request-ipc-bridge.ts
++++ b/src/renderer/src/hooks/ipc-events/terminal-request-ipc-bridge.ts
+@@ -2,7 +2,10 @@ import { requestBackgroundTerminalWorktreeMount } from '@/components/terminal/ba
+ import { getConnectionIdFromState } from '@/lib/connection-context'
+ import { initialAgentTabViewModeProps } from '@/lib/native-chat-initial-view-mode'
+ import { isNativeChatTranscriptLocalReadable } from '@/lib/native-chat-transcript-readability'
+-import { resolveTerminalWorktreeRoute } from '@/lib/terminal-worktree-route'
++import {
++  hasRenderableTerminalWorktreeSurface,
++  resolveTerminalWorktreeRoute
++} from '@/lib/terminal-worktree-route'
+ import { translate } from '@/i18n/i18n'
+ import { useAppStore } from '../../store'
+ import {
+@@ -48,6 +51,16 @@ export function registerTerminalRequestIpcBridge(unsubs: (() => void)[]): void {
+         }
+         const terminalPresentation = resolveTerminalPresentation(data)
+         const shouldActivate = terminalPresentation === 'focused'
++        if (!shouldActivate && !hasRenderableTerminalWorktreeSurface(store, worktreeId)) {
++          window.api.ui.replyTerminalCreate({
++            requestId: data.requestId,
++            error: translate(
++              'auto.hooks.useIpcEvents.unrenderableTerminalWorktreeSurface',
++              'Terminal creation is unavailable because this window has no surface for that worktree'
++            )
++          })
++          return
++        }
+         const shouldSurfaceOwner =
+           terminalPresentation !== 'background' && data.surfaceOwner !== false
+         if (shouldActivate) {
+diff --git a/src/renderer/src/lib/terminal-worktree-renderability.test.ts b/src/renderer/src/lib/terminal-worktree-renderability.test.ts
+new file mode 100644
+index 00000000..47a6d88f
+--- /dev/null
++++ b/src/renderer/src/lib/terminal-worktree-renderability.test.ts
+@@ -0,0 +1,57 @@
++import { describe, expect, it } from 'vitest'
++import type { AppState } from '@/store/types'
++import { FLOATING_TERMINAL_WORKTREE_ID } from '../../../shared/constants'
++import { brandEphemeralSetupTerminalWorktreeId } from '../../../shared/ephemeral-setup-terminal-worktree-id'
++import { folderWorkspaceKey } from '../../../shared/workspace-scope'
++import { hasRenderableTerminalWorktreeSurface } from './terminal-worktree-route'
++
++const EPHEMERAL_ID = brandEphemeralSetupTerminalWorktreeId('hardened-inline-setup')
++
++function state(worktreesByRepo: AppState['worktreesByRepo']): AppState {
++  return {
++    repos: [{ id: 'repo-1', executionHostId: 'local', connectionId: null }],
++    worktreesByRepo,
++    detectedWorktreesByRepo: {},
++    runtimeEnvironments: [],
++    runtimeEnvironmentCatalogHydrated: true,
++    removedRuntimeEnvironmentIds: new Set<string>()
++  } as unknown as AppState
++}
++
++describe('hasRenderableTerminalWorktreeSurface', () => {
++  it('accepts a worktree only when the renderer catalog has one unambiguous row', () => {
++    expect(
++      hasRenderableTerminalWorktreeSurface(
++        state({
++          'repo-1': [{ id: 'repo-1::/work', repoId: 'repo-1', hostId: 'local' }]
++        }),
++        'repo-1::/work'
++      )
++    ).toBe(true)
++
++    expect(hasRenderableTerminalWorktreeSurface(state({ 'repo-1': [] }), 'repo-1::/work')).toBe(
++      false
++    )
++  })
++
++  it('fails closed when duplicate catalog rows disagree about the host', () => {
++    expect(
++      hasRenderableTerminalWorktreeSurface(
++        state({
++          'repo-1': [
++            { id: 'repo-1::/work', repoId: 'repo-1', hostId: 'local' },
++            { id: 'repo-1::/work', repoId: 'repo-1', hostId: 'ssh:other' }
++          ]
++        }),
++        'repo-1::/work'
++      )
++    ).toBe(false)
++  })
++
++  it('preserves surfaces hosted outside the worktree catalog', () => {
++    const empty = state({})
++    expect(hasRenderableTerminalWorktreeSurface(empty, FLOATING_TERMINAL_WORKTREE_ID)).toBe(true)
++    expect(hasRenderableTerminalWorktreeSurface(empty, folderWorkspaceKey('folder-1'))).toBe(true)
++    expect(hasRenderableTerminalWorktreeSurface(empty, EPHEMERAL_ID)).toBe(true)
++  })
++})
+diff --git a/src/renderer/src/lib/terminal-worktree-route.ts b/src/renderer/src/lib/terminal-worktree-route.ts
+index 06e43c23..db45b0c9 100644
+--- a/src/renderer/src/lib/terminal-worktree-route.ts
++++ b/src/renderer/src/lib/terminal-worktree-route.ts
+@@ -10,6 +10,7 @@ import {
+ } from './worktree-runtime-owner'
+ import { resolveWorktreeOperationRouteResult } from './worktree-operation-route'
+ import { getSingleFocusedRuntimeEnvironmentId } from './single-runtime-legacy-owner'
++import { resolveIndexedWorktreeOwner } from './worktree-runtime-owner-index'
+ 
+ export type TerminalWorktreeRoute = {
+   runtimeEnvironmentId: string | null
+@@ -143,3 +144,18 @@ export function resolveTerminalWorktreeRoute(
+ export function hasUnroutableTerminalWorktreeOwner(state: AppState, worktreeId: string): boolean {
+   return resolveTerminalWorktreeRoute(state, worktreeId) === null
+ }
++
++/** Whether this renderer can mount a TerminalPane for the requested workspace. */
++export function hasRenderableTerminalWorktreeSurface(
++  state: Pick<AppState, 'worktreesByRepo'>,
++  worktreeId: string
++): boolean {
++  if (
++    worktreeId === FLOATING_TERMINAL_WORKTREE_ID ||
++    parseWorkspaceKey(worktreeId)?.type === 'folder' ||
++    isEphemeralSetupTerminalWorktreeId(worktreeId)
++  ) {
++    return true
++  }
++  return resolveIndexedWorktreeOwner(state.worktreesByRepo, worktreeId).kind === 'resolved'
++}
