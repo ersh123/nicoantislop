@@ -10,29 +10,32 @@ if [[ ${#packages[@]} -ne 1 ]]; then
 fi
 
 package=${packages[0]}
-info=$(dpkg-deb --field "$package")
+package_name=$(dpkg-deb --field "$package" Package)
 contents=$(dpkg-deb --contents "$package")
 
-grep -q '^ Package: orca-hardened$' <<<" $info" || {
-  echo 'Package field is not orca-hardened' >&2
-  dpkg-deb --field "$package" Package >&2
+if [[ "$package_name" != "orca-hardened" ]]; then
+  printf 'Package field is %q, expected orca-hardened\n' "$package_name" >&2
   exit 1
-}
+fi
 grep -q '/usr/bin/orca-hardened$' <<<"$contents" || {
-  echo 'Hardened CLI symlink is missing' >&2
+  echo 'Hardened CLI entry is missing' >&2
   exit 1
 }
 if grep -q '/usr/bin/orca-ide$' <<<"$contents"; then
   echo 'Package must not overwrite the upstream /usr/bin/orca-ide' >&2
   exit 1
 fi
-grep -q 'orca-hardened-agents.slice$' <<<"$contents" || {
-  echo 'systemd user slice is missing' >&2
+grep -q 'resources/linux/packaging/orca-hardened-agents.slice$' <<<"$contents" || {
+  echo 'systemd user slice resource is missing' >&2
+  exit 1
+}
+grep -q 'resources/linux/packaging/build-manifest.json$' <<<"$contents" || {
+  echo 'build manifest is missing' >&2
   exit 1
 }
 
 sha256sum "$package" | tee dist/SHA256SUMS
 {
   echo "package=$package"
-  dpkg-deb --field "$package" Package Version Architecture
+  dpkg-deb --field "$package" Package Version Architecture Installed-Size
 } | tee dist/package-metadata.txt
