@@ -1,0 +1,141 @@
+diff --git a/config/scripts/electron-builder-linux-hardened-config.test.mjs b/config/scripts/electron-builder-linux-hardened-config.test.mjs
+new file mode 100644
+index 00000000..fc635397
+--- /dev/null
++++ b/config/scripts/electron-builder-linux-hardened-config.test.mjs
+@@ -0,0 +1,55 @@
++import { createRequire } from 'node:module'
++import { describe, expect, it } from 'vitest'
++
++const require = createRequire(import.meta.url)
++
++function withHardenedConfig(assertion) {
++  const configPath = require.resolve('../electron-builder.config.cjs')
++  const keys = ['ORCA_HARDENED_LINUX', 'ORCA_LOCAL_BUILD_VERSION']
++  const original = Object.fromEntries(keys.map((key) => [key, process.env[key]]))
++  try {
++    process.env.ORCA_HARDENED_LINUX = '1'
++    process.env.ORCA_LOCAL_BUILD_VERSION = '1.4.178-hardened.1'
++    delete require.cache[configPath]
++    assertion(require('../electron-builder.config.cjs'))
++  } finally {
++    for (const [key, value] of Object.entries(original)) {
++      if (value === undefined) delete process.env[key]
++      else process.env[key] = value
++    }
++    delete require.cache[configPath]
++    require('../electron-builder.config.cjs')
++  }
++}
++
++describe('Orca Hardened Linux package contract', () => {
++  it('uses an independent identity and produces only one Debian artifact', () => {
++    withHardenedConfig((config) => {
++      expect(config.appId).toBe('com.ersh123.orca-hardened')
++      expect(config.productName).toBe('Orca Hardened')
++      expect(config.linux.executableName).toBe('orca-hardened')
++      expect(config.linux.target).toEqual(['deb'])
++      expect(config.deb.packageName).toBe('orca-hardened')
++      expect(config.deb.artifactName).toBe('orca-hardened_${version}_${arch}.${ext}')
++      expect(config.extraMetadata).toEqual({ version: '1.4.178-hardened.1' })
++      expect(config.publish).toBeUndefined()
++    })
++  })
++
++  it('ships the systemd user slice that contains every managed agent workload', () => {
++    withHardenedConfig((config) => {
++      expect(config.linux.extraResources).toContainEqual({
++        from: 'resources/linux/packaging/orca-hardened-agents.slice',
++        to: 'linux/packaging/orca-hardened-agents.slice'
++      })
++    })
++  })
++
++  it('keeps the upstream build identity unchanged outside hardened builds', () => {
++    const config = require('../electron-builder.config.cjs')
++    expect(config.appId).toBe('com.stablyai.orca')
++    expect(config.productName).toBe('Orca')
++    expect(config.linux.executableName).toBe('orca-ide')
++    expect(config.deb.packageName).toBe('orca-ide')
++  })
++})
+diff --git a/src/main/daemon/linux-terminal-process-boundary.test.ts b/src/main/daemon/linux-terminal-process-boundary.test.ts
+new file mode 100644
+index 00000000..62de70c0
+--- /dev/null
++++ b/src/main/daemon/linux-terminal-process-boundary.test.ts
+@@ -0,0 +1,135 @@
++import { describe, expect, it, vi } from 'vitest'
++import {
++  buildLinuxTerminalScopeLaunch,
++  createLinuxTerminalProcessBoundary,
++  isHardenedLinuxRuntime,
++  resetLinuxTerminalBoundarySupportForTests
++} from './linux-terminal-process-boundary'
++
++const success = { code: 0, signal: null, stdout: '', stderr: '', timedOut: false }
++
++describe('Linux terminal process boundary', () => {
++  it('builds argv without shell concatenation and preserves every user-shell argument', () => {
++    const plan = buildLinuxTerminalScopeLaunch({
++      sessionId: 'term / unsafe $ id',
++      nonce: 'ABC-123',
++      shellPath: '/bin/bash',
++      shellArgs: ['-l', '-c', 'printf "%s" "$HOME"']
++    })
++
++    expect(plan.unitName).toMatch(/^orca-hardened-terminal-[a-f0-9]{16}-abc123\.scope$/)
++    expect(plan.shellPath).toBe('systemd-run')
++    expect(plan.shellArgs.slice(-4)).toEqual([
++      '--',
++      '/bin/bash',
++      '-l',
++      '-c',
++      'printf "%s" "$HOME"'
++    ].slice(-4))
++    expect(plan.shellArgs).toContain('--slice=orca-hardened-agents.slice')
++    expect(plan.shellArgs).toContain('--property=KillMode=control-group')
++  })
++
++  it('gates hardened behavior to Linux plus explicit build identity', () => {
++    expect(
++      isHardenedLinuxRuntime({ platform: 'linux', execPath: '/opt/Orca Hardened/orca-hardened' })
++    ).toBe(true)
++    expect(
++      isHardenedLinuxRuntime({
++        platform: 'linux',
++        execPath: '/opt/Orca/orca-ide',
++        env: { ORCA_HARDENED_LINUX: '1' }
++      })
++    ).toBe(true)
++    expect(
++      isHardenedLinuxRuntime({ platform: 'linux', execPath: '/opt/Orca/orca-ide', env: {} })
++    ).toBe(false)
++    expect(
++      isHardenedLinuxRuntime({ platform: 'darwin', execPath: '/Applications/orca-hardened' })
++    ).toBe(false)
++  })
++
++  it('returns null when the user systemd manager is unavailable', async () => {
++    resetLinuxTerminalBoundarySupportForTests()
++    const runProcess = vi.fn().mockResolvedValue({ ...success, code: 1, stderr: 'no bus' })
++
++    const boundary = await createLinuxTerminalProcessBoundary({
++      enabled: true,
++      sessionId: 'term-1',
++      shellPath: '/bin/bash',
++      shellArgs: ['-l'],
++      nonce: 'n1',
++      runProcess
++    })
++
++    expect(boundary).toBeNull()
++    expect(runProcess).toHaveBeenCalledWith(
++      expect.objectContaining({ program: 'systemctl', args: ['--user', 'show-environment'] })
++    )
++  })
++
++  it('caches the support probe and terminates its unique scope idempotently', async () => {
++    resetLinuxTerminalBoundarySupportForTests()
++    const runProcess = vi.fn().mockResolvedValue(success)
++
