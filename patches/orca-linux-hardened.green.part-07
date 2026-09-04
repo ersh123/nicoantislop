@@ -1,0 +1,260 @@
++      this.pendingExplicitAgents += 1
++    }
++    let released = false
++    return {
++      release: () => {
++        if (released) {
++          return
++        }
++        released = true
++        this.pendingStarts = Math.max(0, this.pendingStarts - 1)
++        if (input.explicitAgent) {
++          this.pendingExplicitAgents = Math.max(0, this.pendingExplicitAgents - 1)
++        }
++      }
++    }
++  }
++
++  snapshot(): TerminalSpawnAdmissionSnapshot {
++    return {
++      pendingStarts: this.pendingStarts,
++      pendingExplicitAgents: this.pendingExplicitAgents
++    }
++  }
++
++  private resolveExplicitAgentLimit(): number {
++    const memory = this.readMemory()
++    if (!memory) {
++      return Math.min(this.hardMaxExplicitAgents, this.fallbackExplicitAgentLimit)
++    }
++    const reservedBytes =
++      this.reservedHostMemoryBytes ??
++      Math.max(4 * GiB, Math.floor(memory.totalBytes * DEFAULT_RESERVED_MEMORY_FRACTION))
++    const usableBytes = Math.max(0, memory.availableBytes - reservedBytes)
++    const memoryLimit = Math.floor(usableBytes / this.estimatedExplicitAgentBytes)
++    return Math.max(0, Math.min(this.hardMaxExplicitAgents, memoryLimit))
++  }
++}
++
++export function createHardenedTerminalSpawnAdmission(
++  env: NodeJS.ProcessEnv = process.env
++): TerminalSpawnAdmission {
++  return new TerminalSpawnAdmission({
++    maxConcurrentStarts: envPositiveInteger(env.ORCA_HARDENED_MAX_CONCURRENT_STARTS),
++    maxLiveTerminals: envPositiveInteger(env.ORCA_HARDENED_MAX_TERMINALS),
++    hardMaxExplicitAgents: envPositiveInteger(env.ORCA_HARDENED_MAX_AGENTS),
++    reservedHostMemoryBytes: envNonNegativeGiB(env.ORCA_HARDENED_RESERVED_MEMORY_GIB),
++    estimatedExplicitAgentBytes: envPositiveMiB(env.ORCA_HARDENED_AGENT_ESTIMATE_MIB),
++    fallbackExplicitAgentLimit: envPositiveInteger(env.ORCA_HARDENED_FALLBACK_AGENTS)
++  })
++}
++
++export function readLinuxMemorySnapshot(): TerminalSpawnMemorySnapshot | null {
++  if (process.platform !== 'linux') {
++    return null
++  }
++  try {
++    const fields = new Map<string, number>()
++    for (const line of readFileSync('/proc/meminfo', 'utf8').split('\n')) {
++      const match = /^([^:]+):\s+(\d+)\s+kB$/.exec(line)
++      if (match) {
++        fields.set(match[1], Number(match[2]) * 1024)
++      }
++    }
++    const totalBytes = fields.get('MemTotal')
++    const availableBytes = fields.get('MemAvailable')
++    return totalBytes && availableBytes !== undefined ? { totalBytes, availableBytes } : null
++  } catch {
++    return null
++  }
++}
++
++function envPositiveInteger(raw: string | undefined): number | undefined {
++  if (!raw?.trim()) {
++    return undefined
++  }
++  const value = Number(raw)
++  return Number.isFinite(value) && value > 0 ? Math.floor(value) : undefined
++}
++
++function envNonNegativeGiB(raw: string | undefined): number | undefined {
++  if (!raw?.trim()) {
++    return undefined
++  }
++  const value = Number(raw)
++  return Number.isFinite(value) && value >= 0 ? value * GiB : undefined
++}
++
++function envPositiveMiB(raw: string | undefined): number | undefined {
++  if (!raw?.trim()) {
++    return undefined
++  }
++  const value = Number(raw)
++  return Number.isFinite(value) && value > 0 ? value * MiB : undefined
++}
++
++function positiveInteger(value: number | undefined, fallback: number): number {
++  return typeof value === 'number' && Number.isFinite(value) && value > 0
++    ? Math.floor(value)
++    : fallback
++}
++
++function positiveNumber(value: number | undefined, fallback: number): number {
++  return typeof value === 'number' && Number.isFinite(value) && value > 0 ? value : fallback
++}
++
++function optionalNonNegativeNumber(value: number | undefined): number | null {
++  return typeof value === 'number' && Number.isFinite(value) && value >= 0 ? value : null
++}
+diff --git a/src/main/runtime/orchestration/lifecycle-reconciliation.ts b/src/main/runtime/orchestration/lifecycle-reconciliation.ts
+index 3d279341..2707fec7 100644
+--- a/src/main/runtime/orchestration/lifecycle-reconciliation.ts
++++ b/src/main/runtime/orchestration/lifecycle-reconciliation.ts
+@@ -1,6 +1,7 @@
+ import type { OrchestrationDb } from './db'
+ import type { MessageRow, WorkerReportOutcome } from './types'
+ import { parsePaneKey } from '../../../shared/stable-pane-id'
++import { requestReclaimableWorkerTerminalReleases } from './worker-terminal-auto-release'
+ 
+ // Why: the tab half can change on pane break-out, while opaque legacy keys
+ // have no safe equivalence beyond exact equality.
+@@ -295,6 +296,9 @@ function reconcileWorkerDoneMessage(
+     return rejectLifecycleMessage(db, msg, settlement.code, settlement.reason, onLog)
+   }
+   suppressEarlierHeartbeats(db, msg, dispatchId)
++  if (!settlement.duplicate) {
++    requestReclaimableWorkerTerminalReleases(db, { maxRequests: 8 })
++  }
+ 
+   if (outcome === 'failed') {
+     onLog(`Task ${taskId} failed by worker report`)
+diff --git a/src/main/runtime/orchestration/worker-terminal-auto-release.test.ts b/src/main/runtime/orchestration/worker-terminal-auto-release.test.ts
+new file mode 100644
+index 00000000..f9e5172a
+--- /dev/null
++++ b/src/main/runtime/orchestration/worker-terminal-auto-release.test.ts
+@@ -0,0 +1,143 @@
++import { describe, expect, it, vi } from 'vitest'
++import { requestReclaimableWorkerTerminalReleases } from './worker-terminal-auto-release'
++import type { WorkerTerminalResourceRow } from './worker-terminal-ownership'
++
++function resource(overrides: Partial<WorkerTerminalResourceRow> = {}): WorkerTerminalResourceRow {
++  return {
++    id: 'resource-1',
++    origin_dispatch_id: 'dispatch-1',
++    owner_dispatch_id: 'dispatch-1',
++    prior_owner_dispatch_ids: '[]',
++    worktree_id: 'worktree-1',
++    terminal_handle: 'term-1',
++    pane_key: 'tab-1:1',
++    process_incarnation: 'pid:1:start:1',
++    host_scope: 'local',
++    ownership_state: 'owned',
++    release_state: 'not_requested',
++    retained_reason: null,
++    release_requested_at: null,
++    release_completed_at: null,
++    release_error: null,
++    archive_source: null,
++    archive_status: null,
++    created_at: '2026-09-05 00:00:00',
++    updated_at: '2026-09-05 00:00:00',
++    ...overrides
++  }
++}
++
++function row(
++  dispatchId: string,
++  terminalState:
++    | 'active'
++    | 'reclaimable'
++    | 'retained'
++    | 'release_pending'
++    | 'release_unknown'
++    | 'released',
++  overrides: Record<string, unknown> = {}
++) {
++  return {
++    dispatchId,
++    taskId: `task-${dispatchId}`,
++    runId: 'run-1',
++    workerState: 'succeeded' as const,
++    dispatchStatus: 'completed' as const,
++    agentTerminalHandle: `term-${dispatchId}`,
++    terminalState,
++    resource: resource({
++      id: `resource-${dispatchId}`,
++      origin_dispatch_id: dispatchId,
++      owner_dispatch_id: dispatchId,
++      terminal_handle: `term-${dispatchId}`
++    }),
++    ...overrides
++  }
++}
++
++describe('requestReclaimableWorkerTerminalReleases', () => {
++  it('requests release for settled coordinator-owned reclaimable workers', () => {
++    const requestWorkerTerminalRelease = vi.fn(() => ({
++      disposition: 'requested' as const,
++      resource: resource()
++    }))
++    const db = {
++      listWorkerTerminalResources: () => [
++        row('success', 'reclaimable'),
++        row('failure', 'reclaimable', { workerState: 'failed' as const })
++      ],
++      requestWorkerTerminalRelease
++    }
++
++    const result = requestReclaimableWorkerTerminalReleases(db)
++
++    expect(requestWorkerTerminalRelease.mock.calls).toEqual([['success'], ['failure']])
++    expect(result).toEqual({ examined: 2, requested: 2, retained: 0, failed: 0 })
++  })
++
++  it('never invents release intent for retained, active, external, or user-owned resources', () => {
++    const requestWorkerTerminalRelease = vi.fn()
++    const db = {
++      listWorkerTerminalResources: () => [
++        row('active', 'active'),
++        row('retained', 'retained'),
++        row('external', 'reclaimable', {
++          resource: resource({ ownership_state: 'external', retained_reason: 'external_terminal' })
++        }),
++        row('user', 'reclaimable', {
++          resource: resource({ ownership_state: 'user_owned', retained_reason: 'user_takeover' })
++        })
++      ],
++      requestWorkerTerminalRelease
++    }
++
++    const result = requestReclaimableWorkerTerminalReleases(db)
++
++    expect(requestWorkerTerminalRelease).not.toHaveBeenCalled()
++    expect(result).toEqual({ examined: 4, requested: 0, retained: 0, failed: 0 })
++  })
++
++  it('honors an explicit user retain even if a stale listing labels it reclaimable', () => {
++    const requestWorkerTerminalRelease = vi.fn()
++    const db = {
++      listWorkerTerminalResources: () => [
++        row('retained', 'reclaimable', {
++          resource: resource({ release_state: 'retained', retained_reason: 'user_requested' })
++        })
++      ],
++      requestWorkerTerminalRelease
++    }
++
++    requestReclaimableWorkerTerminalReleases(db)
++
++    expect(requestWorkerTerminalRelease).not.toHaveBeenCalled()
++  })
++
++  it('bounds one reconciliation pass and records retained or failed requests honestly', () => {
++    const requestWorkerTerminalRelease = vi
++      .fn()
++      .mockReturnValueOnce({
++        disposition: 'retained' as const,
++        resource: resource(),
++        reason: 'identity_unproven' as const
++      })
