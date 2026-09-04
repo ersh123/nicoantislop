@@ -1,0 +1,4 @@
+oBe(true)
++    expect(hasRenderableTerminalWorktreeSurface(empty, EPHEMERAL_ID)).toBe(true)
++  })
++})
